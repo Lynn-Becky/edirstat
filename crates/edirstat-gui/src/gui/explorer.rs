@@ -915,7 +915,7 @@ impl GuiApp {
 
         let provider = TableProviderWrapper::new(snapshot, self.time_format.clone());
 
-        self.table_state.flatten_tree(&provider);
+        let _ = self.table_state.flatten_tree(&provider);
 
         if self.initial_name_col_width.is_none() {
             let available_w = ui.available_width();
