@@ -105,7 +105,7 @@ cargo build --release
 
 The compiled binary will be located at `target/release/edirstat`.
 
-> **Note:** When building on **Windows** you must use the nightly compiler, as `edirstat` requires the nightly feature `windows_by_handle`.
+> **Note:** The desktop app builds on **stable** Rust. Only the wasm32 web frontend (`scripts/build_web.sh`) still needs the pinned nightly toolchain, for `-Zbuild-std` with atomics (wasm threads).
 
 ---
 

@@ -721,7 +721,7 @@ pub fn run_deduplication(
                 });
 
                 if modified_ok && created_ok {
-                    let file_id = crate::file_id::get_file_id(&meta);
+                    let file_id = crate::file_id::get_file_id(std::path::Path::new(&path), &meta);
                     validated_nodes.push(node_idx);
                     validated_file_ids.push(file_id);
                 }

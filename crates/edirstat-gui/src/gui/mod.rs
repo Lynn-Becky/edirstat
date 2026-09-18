@@ -1687,9 +1687,11 @@ impl GuiApp {
                                         if has_any {
                                             for (i, &node_idx) in group.nodes.iter().enumerate() {
                                                 let path_str = snapshot.get_full_path(node_idx);
-                                                if let Ok(meta) = std::fs::metadata(path_str) {
-                                                    let file_id =
-                                                        crate::file_id::get_file_id(&meta);
+                                                if let Ok(meta) = std::fs::metadata(&path_str) {
+                                                    let file_id = crate::file_id::get_file_id(
+                                                        std::path::Path::new(&path_str),
+                                                        &meta,
+                                                    );
                                                     if i < group.file_ids.len() {
                                                         group.file_ids[i] = file_id;
                                                     }

@@ -25,3 +25,8 @@ zstd = "0.14.0"
 # wasm32-unknown-unknown
 [target.'cfg(target_family = "wasm")'.dependencies]
 getrandom = { version = "=0.3", features = ["wasm_js"] }
+
+# Safe wrapper over GetFileInformationByHandle (volume serial + file index);
+# replaces the nightly `windows_by_handle` std feature
+[target.'cfg(windows)'.dependencies]
+winapi-util = "0.1.11"

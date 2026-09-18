@@ -65,7 +65,7 @@ jobs:
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-07-15
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Cache dependencies

@@ -62,7 +62,7 @@ jobs:
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-07-15
+          toolchain: stable
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
@@ -128,9 +128,6 @@ jobs:
         run: |
           pacman -Syu --noconfirm binaryen
 
-      - name: Add WebAssembly target
-        run: rustup target add wasm32-unknown-unknown
-
       - name: Install wasm-bindgen-cli matching lockfile
         run: |
           cargo install wasm-bindgen-cli --version $(grep -A 1 'name = "wasm-bindgen"' Cargo.lock | grep version | cut -d '"' -f 2)
@@ -158,7 +155,7 @@ jobs:
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-07-15
+          toolchain: stable
           target: x86_64-pc-windows-msvc
 
       - name: Cache dependencies
@@ -213,7 +210,7 @@ jobs:
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-07-15
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Cache dependencies

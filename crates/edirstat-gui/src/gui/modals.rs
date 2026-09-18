@@ -2539,7 +2539,7 @@ impl GuiApp {
                     let mut ancestors: smallvec::SmallVec<[(u64, u64); 16]> = smallvec::smallvec![];
                     for ancestor_path in path.ancestors() {
                         if let Ok(meta) = std::fs::metadata(ancestor_path) {
-                            ancestors.push(crate::file_id::get_file_id(&meta));
+                            ancestors.push(crate::file_id::get_file_id(ancestor_path, &meta));
                         }
                     }
                     // Reverse so that the root ancestor is first and the target path is last

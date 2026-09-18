@@ -33,8 +33,6 @@
 //! desktop GUI binary. See the [repository](https://github.com/xangelix/edirstat)
 //! for full documentation and the companion crates `edirstat-core` and
 //! `edirstat-gui`.
-// --- Feature Gates ---
-#![cfg_attr(windows, feature(windows_by_handle))]
 
 pub mod engine;
 

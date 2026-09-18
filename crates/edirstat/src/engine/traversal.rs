@@ -139,10 +139,15 @@ impl TraversalEngine {
             // Build initial scan task
             let root_id = (0, 0); // Placeholder for root
             let root_metadata = fs::metadata(&root_path);
-            let root_file_id = root_metadata.as_ref().map_or(root_id, get_file_id);
+            let root_file_id = root_metadata
+                .as_ref()
+                .map_or(root_id, |m| get_file_id(&root_path, m));
             let (expected_device_id, allowed_secondary_device_id) = if same_filesystem {
                 (
-                    root_metadata.as_ref().map(get_device_id).ok(),
+                    root_metadata
+                        .as_ref()
+                        .map(|m| get_device_id(&root_path, m))
+                        .ok(),
                     get_secondary_device_id(&root_path),
                 )
             } else {
@@ -469,21 +474,19 @@ fn scan_directory(task: &ScanTask, ctx: &mut WorkerContext<'_>) {
 }
 
 #[cfg(unix)]
-fn get_device_id(meta: &fs::Metadata) -> u64 {
+fn get_device_id(_path: &Path, meta: &fs::Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt as _;
 
     meta.dev()
 }
 
 #[cfg(windows)]
-fn get_device_id(meta: &fs::Metadata) -> u64 {
-    use std::os::windows::fs::MetadataExt as _;
-
-    meta.volume_serial_number().unwrap_or(0) as u64
+fn get_device_id(path: &Path, meta: &fs::Metadata) -> u64 {
+    get_file_id(path, meta).0
 }
 
 #[cfg(not(any(unix, windows)))]
-fn get_device_id(_meta: &fs::Metadata) -> u64 {
+fn get_device_id(_path: &Path, _meta: &fs::Metadata) -> u64 {
     0
 }
 
@@ -496,7 +499,7 @@ fn get_secondary_device_id(root_path: &Path) -> Option<u64> {
         fs::metadata("/System/Volumes/Data")
             .ok()
             .as_ref()
-            .map(get_device_id)
+            .map(|m| get_device_id(Path::new("/System/Volumes/Data"), m))
     } else {
         None
     }

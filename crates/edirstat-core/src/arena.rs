@@ -1101,7 +1101,7 @@ impl EntryMetadata {
                     .created()
                     .map_or(0, crate::time_utils::system_time_to_unix_timestamp);
 
-                let file_id = crate::file_id::get_file_id(&metadata);
+                let file_id = crate::file_id::get_entry_file_id(entry, &metadata);
 
                 Some(Self {
                     name,
