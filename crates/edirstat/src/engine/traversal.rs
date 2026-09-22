@@ -64,6 +64,7 @@ pub enum ScanEvent {
 pub struct TraversalEngine {
     num_threads: usize,
     stats: TraversalStats,
+    allow_mft: bool,
 }
 
 impl Default for TraversalEngine {
@@ -76,7 +77,13 @@ impl TraversalEngine {
     #[must_use]
     pub fn new(stats: TraversalStats) -> Self {
         let num_threads = thread::available_parallelism().map_or(4, std::num::NonZero::get);
-        Self { num_threads, stats }
+        Self { num_threads, stats, allow_mft: true }
+    }
+
+    #[must_use]
+    pub const fn without_mft(mut self) -> Self {
+        self.allow_mft = false;
+        self
     }
 
     #[must_use]
@@ -98,6 +105,7 @@ impl TraversalEngine {
     ) -> Result<thread::JoinHandle<()>, crate::EdirstatError> {
         let num_threads = self.num_threads;
         let stats = self.stats.clone();
+        let allow_mft = self.allow_mft;
 
         let handle = thread::spawn(move || {
             // Run MFT parser directly if target is a file named "$MFT" (case-insensitive)
@@ -106,12 +114,16 @@ impl TraversalEngine {
                 .and_then(|s| s.to_str())
                 .is_some_and(|s| s.eq_ignore_ascii_case("$mft"));
 
-            if is_mft_file {
+            if allow_mft && is_mft_file {
                 match super::mft::try_scan_mft(&root_path, &scan_cancel.clone(), &event_tx, &stats)
                 {
-                    Ok(()) => return,
+                    Ok(()) => {
+                        stats.backend.store(1, Ordering::SeqCst);
+                        return;
+                    }
                     Err(_) => {
                         stats.reset();
+                        stats.mft_fallback.store(true, Ordering::SeqCst);
                     }
                 }
             }
@@ -119,19 +131,23 @@ impl TraversalEngine {
             // Attempt raw MFT parsing on Windows only if partition is explicitly detected as NTFS
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             {
-                if super::mft::is_ntfs(&root_path) {
+                if allow_mft && !is_mft_file && super::mft::is_ntfs(&root_path) {
                     match super::mft::try_scan_mft(&root_path, &scan_cancel, &event_tx, &stats) {
                         Ok(()) => {
+                            stats.backend.store(1, Ordering::SeqCst);
                             // Raw scan was executed successfully, end thread execution
                             return;
                         }
                         Err(_) => {
                             // Bypassed or failed raw access; fallback continues to parallel walker
                             stats.reset();
+                            stats.mft_fallback.store(true, Ordering::SeqCst);
                         }
                     }
                 }
             }
+
+            stats.backend.store(2, Ordering::SeqCst);
 
             // Setup global injector for starting and overflow tasks
             let injector = Arc::new(Injector::new());

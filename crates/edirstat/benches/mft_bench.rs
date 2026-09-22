@@ -37,6 +37,7 @@ fn bench_mft_parsing(c: &mut Criterion) {
                 files_scanned: Arc::new(AtomicUsize::new(0)),
                 dirs_scanned: Arc::new(AtomicUsize::new(0)),
                 bytes_scanned: Arc::new(AtomicUsize::new(0)),
+                ..TraversalStats::default()
             };
 
             let cancel_token = Arc::new(std::sync::atomic::AtomicBool::new(false));

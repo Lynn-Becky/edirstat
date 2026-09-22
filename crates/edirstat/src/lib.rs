@@ -37,8 +37,10 @@
 pub mod engine;
 
 pub use edirstat_core::{EdirstatError, arena, fs_utils, snapshot, time_utils};
+#[cfg(feature = "gui")]
 pub use edirstat_gui as gui;
 pub use engine::{coordinator, traversal};
+#[cfg(feature = "gui")]
 pub use gui::colors;
 
 pub mod model {
@@ -46,6 +48,7 @@ pub mod model {
 
     pub mod persistence {
         pub use edirstat_core::snapshot;
+        #[cfg(feature = "gui")]
         pub use edirstat_gui::preferences;
     }
 }

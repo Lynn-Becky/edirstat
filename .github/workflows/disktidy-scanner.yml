@@ -1,0 +1,39 @@
+name: DiskTidy scanner
+
+on:
+  push:
+    branches: [disktidy-scanner]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-scanner:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Build headless scanner
+        run: cargo build --release --target x86_64-pc-windows-msvc -p edirstat --bin edirstat-scan --no-default-features
+      - name: Test scan engine
+        run: cargo test -p edirstat --lib --no-default-features
+      - name: Smoke test SQLite export
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path target/scanner-fixture | Out-Null
+          Set-Content -LiteralPath target/scanner-fixture/file.txt -Value 'scanner smoke test'
+          & target/x86_64-pc-windows-msvc/release/edirstat-scan.exe target/scanner-fixture --output target/scanner-smoke.sqlite3 --engine walk
+          if ($LASTEXITCODE -ne 0) { throw 'Scanner failed' }
+          if (!(Test-Path -LiteralPath target/scanner-smoke.sqlite3)) { throw 'SQLite snapshot missing' }
+      - name: Upload scanner and resolved lockfile
+        uses: actions/upload-artifact@v4
+        with:
+          name: edirstat-scan-windows-x64
+          path: |
+            target/x86_64-pc-windows-msvc/release/edirstat-scan.exe
+            Cargo.lock
+          if-no-files-found: error

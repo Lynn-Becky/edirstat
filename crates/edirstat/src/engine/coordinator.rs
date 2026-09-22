@@ -29,6 +29,15 @@ impl Coordinator {
     }
 
     pub fn run_coordinator_loop(&mut self, root_path_str: &str) {
+        self.run_coordinator_loop_with_publishing(root_path_str, true);
+    }
+
+    /// Build only the final arena for headless exports. Avoid periodic full-tree clones.
+    pub fn run_coordinator_loop_headless(&mut self, root_path_str: &str) {
+        self.run_coordinator_loop_with_publishing(root_path_str, false);
+    }
+
+    fn run_coordinator_loop_with_publishing(&mut self, root_path_str: &str, publish_live: bool) {
         self.shared_state.is_scanning.store(true, Ordering::SeqCst);
 
         let mut arena = Vec::with_capacity(1024 * 1024); // Pre-allocate space for ~1M nodes
@@ -190,7 +199,7 @@ impl Coordinator {
             }
 
             // Publish snapshot if dirty and scaled interval elapsed
-            if dirty && last_publish.elapsed() >= publish_interval {
+            if publish_live && dirty && last_publish.elapsed() >= publish_interval {
                 let current_size = arena.len();
 
                 // Dynamically scale updates to prevent main thread rendering stutter

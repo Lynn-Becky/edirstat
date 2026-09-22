@@ -15,6 +15,10 @@ pub struct TraversalStats {
     pub files_scanned: Arc<AtomicUsize>,
     pub dirs_scanned: Arc<AtomicUsize>,
     pub bytes_scanned: Arc<AtomicUsize>,
+    /// 0 = pending, 1 = raw MFT, 2 = directory walker.
+    pub backend: Arc<AtomicUsize>,
+    /// Set when raw MFT was attempted but the walker had to take over.
+    pub mft_fallback: Arc<AtomicBool>,
 }
 
 impl TraversalStats {
@@ -22,6 +26,8 @@ impl TraversalStats {
         self.files_scanned.store(0, Ordering::SeqCst);
         self.dirs_scanned.store(0, Ordering::SeqCst);
         self.bytes_scanned.store(0, Ordering::SeqCst);
+        self.backend.store(0, Ordering::SeqCst);
+        self.mft_fallback.store(false, Ordering::SeqCst);
     }
 }
 
