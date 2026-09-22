@@ -1254,6 +1254,7 @@ mod tests {
             let engine = TraversalEngine {
                 num_threads: 32,
                 stats: shared_state.scan_stats.clone(),
+                allow_mft: true,
             };
             let (tx, rx) = crossbeam::channel::unbounded();
             let handle = engine.start_traversal(
@@ -1311,6 +1312,7 @@ mod tests {
             let engine = TraversalEngine {
                 num_threads: 32,
                 stats: shared_state.scan_stats.clone(),
+                allow_mft: true,
             };
             let (tx, rx) = crossbeam::channel::unbounded();
             let handle = engine.start_traversal(
