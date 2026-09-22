@@ -1,5 +1,36 @@
 # eDirStat
 
+## DiskTidy headless SQLite adapter
+
+This fork also builds a scan-only CLI without the GUI dependency:
+
+```sh
+cargo build --locked --release -p edirstat --bin edirstat-scan --no-default-features
+edirstat-scan C:\ --output C:\scan-cache\drive.sqlite3 --task-id myscan --same-filesystem
+```
+
+The adapter writes one immutable SQLite database and UTF-8 JSON Lines progress
+to stdout. `--engine walk` skips raw MFT access for folder scans. `--exclude`
+may be repeated for application state and quarantine directories. For a
+separately elevated process, `--progress-file` writes the same JSONL protocol
+to a new file, while creation of `--cancel-file` requests cooperative stop.
+An existing output is never overwritten; failed or cancelled scans do not
+publish an output database.
+
+Protocol v1 events are `start`, `progress`, `fallback`, `complete`, `cancelled`,
+and `error`. `progress.phase` is `scan`, `write`, or `index`; counts are absolute,
+and no percentage is claimed when a total is unknown. The final `complete`
+event reports the actual `backend` (`mft` or `walk`).
+
+The SQLite v1 `metadata` table records `format_version`, `root`, `backend`,
+`file_count`, `directory_count`, and `logical_bytes`. `nodes` stores arena IDs,
+parent IDs, base names, logical sizes, flags, and whole-second timestamps
+expressed as nanoseconds. `directories` stores directory relative paths for
+fast reconstruction. `allocated_size` is NULL when the scanner cannot report
+it; clients must label any logical-size substitute as an estimate. File IDs
+are local to one scan and are not stable filesystem identities. DiskTidy
+rechecks candidate identities and content before proposing any file action.
+
 ![eDirStat Treemap](docs/screenshots/treemap-b-logo.png)
 
 [![Crates.io](https://img.shields.io/crates/v/edirstat)](https://crates.io/crates/edirstat)

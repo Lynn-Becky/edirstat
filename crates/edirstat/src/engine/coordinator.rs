@@ -69,6 +69,19 @@ impl Coordinator {
         while let Ok(batch) = self.event_rx.recv() {
             for event in batch {
                 match event {
+                    ScanEvent::ResetForFallback => {
+                        arena.clear();
+                        string_pool = StringPool::new();
+                        ext_map.clear();
+                        id_map.clear();
+                        last_child_map.clear();
+                        let root_name_id = string_pool.get_or_insert(root_path_str.as_bytes());
+                        arena.push(FileNode::new(root_name_id, None, true, false, 0, 0));
+                        last_child_map.push(NO_INDEX);
+                        register_id(&mut id_map, 0, LocalId(0), 0);
+                        last_publish = Instant::now() - publish_interval;
+                        dirty = true;
+                    }
                     ScanEvent::DirDiscovered {
                         parent_worker_id,
                         child_worker_id,
@@ -401,6 +414,32 @@ mod tests {
         assert_eq!(resolve_id(&id_map, 0, LocalId(6)), None);
         // Never-registered worker
         assert_eq!(resolve_id(&id_map, 3, LocalId(9)), None);
+    }
+
+    #[test]
+    fn test_mft_fallback_discards_partial_tree() -> Result<(), crate::EdirstatError> {
+        let shared = Arc::new(SharedState::new());
+        let (tx, rx) = crossbeam::channel::unbounded();
+        let file = |name: &str| ScanEvent::FileDiscovered {
+            parent_worker_id: 0,
+            local_parent_id: LocalId(0),
+            name: CompactString::new(name),
+            size: 7,
+            is_symlink: false,
+            is_dataless: false,
+            is_special: false,
+            modified_timestamp: 0,
+            created_timestamp: 0,
+            no_permission: false,
+        };
+        tx.send(vec![file("partial"), ScanEvent::ResetForFallback, file("walker")])
+            .map_err(std::io::Error::other)?;
+        drop(tx);
+        Coordinator::new(rx, shared.clone()).run_coordinator_loop_headless("/root");
+        let snapshot = shared.current_snapshot.load();
+        assert_eq!(snapshot.nodes.len(), 2);
+        assert_eq!(snapshot.string_pool.get(snapshot.nodes[1].name_id), Some("walker"));
+        Ok(())
     }
 
     #[test]

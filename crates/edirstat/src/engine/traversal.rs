@@ -33,6 +33,8 @@ pub struct ScanTask {
 }
 
 pub enum ScanEvent {
+    /// Discard any partially emitted raw-MFT tree before walker fallback.
+    ResetForFallback,
     DirDiscovered {
         parent_worker_id: u8,
         child_worker_id: u8,
@@ -124,6 +126,7 @@ impl TraversalEngine {
                     Err(_) => {
                         stats.reset();
                         stats.mft_fallback.store(true, Ordering::SeqCst);
+                        let _ = event_tx.send(vec![ScanEvent::ResetForFallback]);
                     }
                 }
             }
@@ -142,6 +145,7 @@ impl TraversalEngine {
                             // Bypassed or failed raw access; fallback continues to parallel walker
                             stats.reset();
                             stats.mft_fallback.store(true, Ordering::SeqCst);
+                            let _ = event_tx.send(vec![ScanEvent::ResetForFallback]);
                         }
                     }
                 }
