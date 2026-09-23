@@ -19,6 +19,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked -p edirstat --lib --no-default-features -- -D warnings
+      - run: cargo clippy --locked -p edirstat --bin edirstat-scan --no-default-features -- -D warnings
       - run: cargo test --locked -p edirstat --lib --no-default-features
 
   windows-scanner:

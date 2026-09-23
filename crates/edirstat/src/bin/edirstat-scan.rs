@@ -68,6 +68,16 @@ type EventSink = Arc<Mutex<Box<dyn Write + Send>>>;
 
 struct PendingSnapshot(PathBuf);
 
+struct SnapshotExport<'a> {
+    output: &'a Path,
+    task_id: &'a str,
+    root: &'a Path,
+    excludes: &'a [PathBuf],
+    backend: &'a str,
+    sink: &'a EventSink,
+    cancel: &'a AtomicBool,
+}
+
 impl Drop for PendingSnapshot {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
@@ -99,15 +109,16 @@ fn new_sink(path: Option<&Path>) -> Result<EventSink> {
 }
 
 fn write_snapshot(
-    output: &Path,
-    task_id: &str,
-    root: &Path,
     snapshot: &edirstat::arena::FileArenaSnapshot,
-    excludes: &[PathBuf],
-    backend: &str,
-    sink: &EventSink,
-    cancel: &AtomicBool,
+    export: &SnapshotExport<'_>,
 ) -> Result<(u64, u64, u64)> {
+    let output = export.output;
+    let task_id = export.task_id;
+    let root = export.root;
+    let excludes = export.excludes;
+    let backend = export.backend;
+    let sink = export.sink;
+    let cancel = export.cancel;
     if output.exists() {
         bail!("Output already exists: {}", output.display());
     }
@@ -392,16 +403,16 @@ fn run(args: &Args, sink: &EventSink) -> Result<()> {
         sink,
         &json!({"version":1,"type":"progress","phase":"write","nodes":snapshot.nodes.len()}),
     )?;
-    let (files, dirs, bytes) = write_snapshot(
-        &args.output,
-        &args.task_id,
-        &root,
-        &snapshot,
-        &excludes,
+    let export = SnapshotExport {
+        output: &args.output,
+        task_id: &args.task_id,
+        root: &root,
+        excludes: &excludes,
         backend,
         sink,
-        &shared.scan_cancel,
-    )?;
+        cancel: shared.scan_cancel.as_ref(),
+    };
+    let (files, dirs, bytes) = write_snapshot(&snapshot, &export)?;
     stop.store(true, Ordering::SeqCst);
     let _ = ticker.join();
     emit(
