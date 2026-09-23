@@ -9,6 +9,24 @@ permissions:
   contents: read
 
 jobs:
+  format-source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all
+      - uses: actions/upload-artifact@v4
+        with:
+          name: edirstat-rustfmt-source
+          path: |
+            crates/edirstat/src/bin/edirstat-scan.rs
+            crates/edirstat/src/engine/traversal.rs
+            crates/edirstat/src/engine/coordinator.rs
+            crates/edirstat-core/src/state.rs
+            crates/edirstat/benches/mft_bench.rs
+
   linux-engine-tests:
     runs-on: ubuntu-latest
     steps:
