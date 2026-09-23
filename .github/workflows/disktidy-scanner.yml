@@ -30,11 +30,13 @@ jobs:
       - name: Smoke test SQLite export
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path target/scanner-fixture | Out-Null
-          Set-Content -LiteralPath target/scanner-fixture/file.txt -Value 'scanner smoke test'
-          & target/x86_64-pc-windows-msvc/release/edirstat-scan.exe target/scanner-fixture --output target/scanner-smoke.sqlite3 --engine walk
+          $smokeRoot = Join-Path $env:RUNNER_TEMP "edirstat-smoke-$env:GITHUB_RUN_ID"
+          New-Item -ItemType Directory -Path $smokeRoot -Force | Out-Null
+          Set-Content -LiteralPath (Join-Path $smokeRoot 'file.txt') -Value 'scanner smoke test'
+          $snapshot = Join-Path $smokeRoot 'scan.sqlite3'
+          & target/x86_64-pc-windows-msvc/release/edirstat-scan.exe $smokeRoot --output $snapshot --engine walk
           if ($LASTEXITCODE -ne 0) { throw 'Scanner failed' }
-          if (!(Test-Path -LiteralPath target/scanner-smoke.sqlite3)) { throw 'SQLite snapshot missing' }
+          if (!(Test-Path -LiteralPath $snapshot)) { throw 'SQLite snapshot missing' }
       - name: Upload scanner and resolved lockfile
         uses: actions/upload-artifact@v4
         with:

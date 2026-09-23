@@ -2,7 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    fs::{File, OpenOptions},
+    fs::OpenOptions,
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}},
