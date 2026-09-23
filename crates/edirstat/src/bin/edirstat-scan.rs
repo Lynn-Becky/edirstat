@@ -345,7 +345,17 @@ fn run(args: &Args, sink: &EventSink) -> Result<()> {
         .join()
         .map_err(|_| anyhow::anyhow!("Traversal thread panicked"))?;
     scan_finished.store(true, Ordering::SeqCst);
-    if budget_exceeded.load(Ordering::SeqCst) {
+    let scanned_files = shared.scan_stats.files_scanned.load(Ordering::Relaxed) as u64;
+    let scanned_dirs = shared.scan_stats.dirs_scanned.load(Ordering::Relaxed) as u64;
+    if budget_exceeded.load(Ordering::SeqCst)
+        || args.max_files.is_some_and(|limit| scanned_files >= limit)
+        || args
+            .max_entries
+            .is_some_and(|limit| scanned_files.saturating_add(scanned_dirs) >= limit)
+        || args
+            .max_seconds
+            .is_some_and(|limit| started.elapsed().as_secs_f64() >= limit)
+    {
         bail!("Scan enumeration budget exceeded");
     }
     if matches!(args.engine, Engine::Mft)
