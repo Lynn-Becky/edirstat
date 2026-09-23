@@ -20,6 +20,41 @@ pub use edirstat_core::{file_id::get_file_id, state::TraversalStats};
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct LocalId(pub u32);
 
+/// Per-node metadata kept beside the arena so that `FileNode` and the `.edst`
+/// layout stay unchanged. Each field has an explicit "unknown" value.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct NodeMeta {
+    /// Bytes allocated on disk across all data streams; `u64::MAX` when unknown.
+    pub allocated_size: u64,
+    /// NTFS file reference (record number and sequence) or inode; 0 when unknown.
+    pub file_id: u64,
+    /// Last write time as a Windows `FILETIME` (100 ns since 1601); 0 when unknown.
+    pub modified_filetime: u64,
+    /// Raw Windows file attribute bits; `u32::MAX` when unknown.
+    pub attributes: u32,
+    /// Reparse point tag; 0 when absent or unknown.
+    pub reparse_tag: u32,
+    /// Hard links, not counting DOS short names; 0 when unknown.
+    pub link_count: u32,
+}
+
+impl NodeMeta {
+    pub const UNKNOWN: Self = Self {
+        allocated_size: u64::MAX,
+        file_id: 0,
+        modified_filetime: 0,
+        attributes: u32::MAX,
+        reparse_tag: 0,
+        link_count: 0,
+    };
+}
+
+impl Default for NodeMeta {
+    fn default() -> Self {
+        Self::UNKNOWN
+    }
+}
+
 #[derive(Clone)]
 pub struct ScanTask {
     pub path: PathBuf,
@@ -44,6 +79,7 @@ pub enum ScanEvent {
         modified_timestamp: u32,
         created_timestamp: u32,
         no_permission: bool,
+        meta: NodeMeta,
     },
     FileDiscovered {
         parent_worker_id: u8,
@@ -56,6 +92,7 @@ pub enum ScanEvent {
         modified_timestamp: u32,
         created_timestamp: u32,
         no_permission: bool,
+        meta: NodeMeta,
     },
     PermissionDenied {
         worker_id: u8,
@@ -406,6 +443,7 @@ fn scan_directory(task: &ScanTask, ctx: &mut WorkerContext<'_>) {
         let Some(meta) = crate::arena::EntryMetadata::from_dir_entry(&entry) else {
             continue;
         };
+        let node_meta = entry_meta(&entry, meta.file_id.1);
 
         // Check if directory
         if meta.is_dir {
@@ -444,6 +482,7 @@ fn scan_directory(task: &ScanTask, ctx: &mut WorkerContext<'_>) {
                     modified_timestamp: meta.modified_timestamp,
                     created_timestamp: meta.created_timestamp,
                     no_permission: meta.no_permission,
+                    meta: node_meta,
                 },
                 true,
             );
@@ -486,6 +525,7 @@ fn scan_directory(task: &ScanTask, ctx: &mut WorkerContext<'_>) {
                     modified_timestamp: meta.modified_timestamp,
                     created_timestamp: meta.created_timestamp,
                     no_permission: meta.no_permission,
+                    meta: node_meta,
                 },
                 false,
             );
@@ -505,9 +545,37 @@ fn scan_directory(task: &ScanTask, ctx: &mut WorkerContext<'_>) {
             modified_timestamp: 0,
             created_timestamp: 0,
             no_permission: false,
+            meta: NodeMeta::UNKNOWN,
         },
         true,
     );
+}
+
+/// Side metadata for a walked entry. On Windows the directory enumeration
+/// already carries attributes and the full-precision write time, so no extra
+/// system call is made; allocation and link counts would need a file open and
+/// stay unknown.
+#[cfg(windows)]
+fn entry_meta(entry: &fs::DirEntry, file_index: u64) -> NodeMeta {
+    use std::os::windows::fs::MetadataExt as _;
+
+    entry
+        .metadata()
+        .map_or(NodeMeta::UNKNOWN, |metadata| NodeMeta {
+            file_id: file_index,
+            modified_filetime: metadata.last_write_time(),
+            attributes: metadata.file_attributes(),
+            ..NodeMeta::UNKNOWN
+        })
+}
+
+/// Side metadata for a walked entry; only the inode is available for free.
+#[cfg(not(windows))]
+const fn entry_meta(_entry: &fs::DirEntry, file_index: u64) -> NodeMeta {
+    NodeMeta {
+        file_id: file_index,
+        ..NodeMeta::UNKNOWN
+    }
 }
 
 #[cfg(unix)]
@@ -800,6 +868,47 @@ mod tests {
         assert_eq!(stats.files_scanned.load(Ordering::SeqCst), 1);
         assert_eq!(stats.dirs_scanned.load(Ordering::SeqCst), 2); // temp_dir and subdir
         assert_eq!(stats.bytes_scanned.load(Ordering::SeqCst), 50);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_walk_collects_windows_side_metadata() -> Result<(), crate::EdirstatError> {
+        let temp_dir = std::env::current_dir()?
+            .join("target")
+            .join("test_traversal_side_metadata");
+        let subdir = temp_dir.join("sub");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&subdir)?;
+        std::fs::write(subdir.join("f.txt"), b"side metadata")?;
+
+        let shared_state = Arc::new(SharedState::new());
+        let engine = TraversalEngine::new(shared_state.scan_stats.clone()).without_mft();
+        let (tx, rx) = crossbeam::channel::unbounded();
+        let handle = engine.start_traversal(
+            temp_dir.clone(),
+            false,
+            shared_state.scan_cancel.clone(),
+            tx,
+        )?;
+        let metas = Coordinator::new(rx, shared_state.clone())
+            .run_coordinator_loop_headless_with_metadata(&temp_dir.to_string_lossy());
+        let _ = handle.join();
+
+        let snapshot = shared_state.current_snapshot.load();
+        assert_eq!(metas.len(), snapshot.nodes.len());
+        let file = node_index(&snapshot, "f.txt")
+            .ok_or_else(|| std::io::Error::other("file node missing"))?;
+        let dir = node_index(&snapshot, "sub")
+            .ok_or_else(|| std::io::Error::other("directory node missing"))?;
+        assert_ne!(metas[file].modified_filetime, 0);
+        assert_ne!(metas[file].attributes, u32::MAX);
+        assert_eq!(metas[file].attributes & 0x10, 0);
+        assert_eq!(metas[file].allocated_size, u64::MAX);
+        assert_ne!(metas[dir].attributes & 0x10, 0);
+        assert_ne!(metas[dir].file_id, 0);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
         Ok(())

@@ -16,9 +16,9 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use edirstat::{
-    arena::NO_INDEX,
+    arena::{FileNode, NO_INDEX},
     coordinator::{Coordinator, SharedState},
-    traversal::TraversalEngine,
+    traversal::{NodeMeta, TraversalEngine},
 };
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
@@ -66,6 +66,12 @@ struct Args {
 
 type EventSink = Arc<Mutex<Box<dyn Write + Send>>>;
 
+/// SQLite layout version shared with DiskTidy's `sqlite_snapshot.FORMAT_VERSION`.
+const FORMAT_VERSION: &str = "2";
+/// Offset between the Windows `FILETIME` epoch (1601) and the Unix epoch, in 100 ns units.
+const FILETIME_UNIX_EPOCH: i128 = 116_444_736_000_000_000;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
 struct PendingSnapshot(PathBuf);
 
 struct SnapshotExport<'a> {
@@ -74,6 +80,7 @@ struct SnapshotExport<'a> {
     root: &'a Path,
     excludes: &'a [PathBuf],
     backend: &'a str,
+    metas: &'a [NodeMeta],
     sink: &'a EventSink,
     cancel: &'a AtomicBool,
 }
@@ -108,6 +115,55 @@ fn new_sink(path: Option<&Path>) -> Result<EventSink> {
     Ok(Arc::new(Mutex::new(output)))
 }
 
+/// Converts a Windows `FILETIME` to Unix nanoseconds; `None` for 0 (unknown).
+fn filetime_to_unix_ns(filetime: u64) -> Option<i64> {
+    if filetime == 0 {
+        return None;
+    }
+    i64::try_from((i128::from(filetime) - FILETIME_UNIX_EPOCH) * 100).ok()
+}
+
+/// Bytes allocated under each node: a file's own allocation, or the sum over a
+/// directory's files. `None` when any contributing allocation is unknown.
+fn subtree_allocations(nodes: &[FileNode], metas: &[NodeMeta]) -> Vec<Option<u64>> {
+    let mut totals: Vec<Option<u64>> = nodes
+        .iter()
+        .zip(metas)
+        .map(|(node, meta)| {
+            if node.is_directory() {
+                Some(0)
+            } else if meta.allocated_size == u64::MAX {
+                None
+            } else {
+                Some(meta.allocated_size)
+            }
+        })
+        .collect();
+    // Children always follow their parent in the arena.
+    for idx in (1..totals.len()).rev() {
+        let parent = nodes[idx].parent as usize;
+        if nodes[idx].parent == NO_INDEX || parent >= idx {
+            continue;
+        }
+        totals[parent] = match (totals[parent], totals[idx]) {
+            (Some(total), Some(child)) => Some(total.saturating_add(child)),
+            _ => None,
+        };
+    }
+    totals
+}
+
+/// Reparse tag column: 0 without a reparse point, `None` when the tag was not read.
+fn reparse_tag_value(meta: &NodeMeta) -> Option<i64> {
+    if meta.reparse_tag != 0 {
+        Some(i64::from(meta.reparse_tag))
+    } else if meta.attributes != u32::MAX && meta.attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+        Some(0)
+    } else {
+        None
+    }
+}
+
 fn write_snapshot(
     snapshot: &edirstat::arena::FileArenaSnapshot,
     export: &SnapshotExport<'_>,
@@ -117,6 +173,7 @@ fn write_snapshot(
     let root = export.root;
     let excludes = export.excludes;
     let backend = export.backend;
+    let metas = export.metas;
     let sink = export.sink;
     let cancel = export.cancel;
     if output.exists() {
@@ -140,7 +197,8 @@ fn write_snapshot(
             id INTEGER PRIMARY KEY, parent_id INTEGER, name TEXT NOT NULL,
             is_dir INTEGER NOT NULL, size INTEGER NOT NULL, allocated_size INTEGER,
             modified_ns INTEGER, created_ns INTEGER, flags INTEGER NOT NULL,
-            file_count INTEGER NOT NULL
+            file_count INTEGER NOT NULL, file_id INTEGER, attributes INTEGER,
+            reparse_tag INTEGER, link_count INTEGER
         );
         CREATE TABLE directories (node_id INTEGER PRIMARY KEY, relative_path TEXT NOT NULL);",
     )?;
@@ -149,13 +207,17 @@ fn write_snapshot(
     let mut files = 0u64;
     let mut dirs = 0u64;
     let mut bytes = 0u64;
+    let mut allocated_bytes = 0u64;
+    let mut unknown_allocations = 0u64;
+    let allocations = subtree_allocations(&snapshot.nodes, metas);
     let root_text = root.to_string_lossy().to_string();
     let tx = db.transaction()?;
     {
         let mut node_insert = tx.prepare_cached(
             "INSERT INTO nodes
-            (id,parent_id,name,is_dir,size,allocated_size,modified_ns,created_ns,flags,file_count)
-            VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (id,parent_id,name,is_dir,size,allocated_size,modified_ns,created_ns,flags,file_count,
+            file_id,attributes,reparse_tag,link_count)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         )?;
         let mut dir_insert =
             tx.prepare_cached("INSERT INTO directories(node_id,relative_path) VALUES (?,?)")?;
@@ -197,11 +259,20 @@ fn write_snapshot(
                     continue;
                 }
             }
-            let modified_ns = if node.modified_timestamp == 0 {
+            let meta = metas.get(idx).copied().unwrap_or(NodeMeta::UNKNOWN);
+            // Directories keep the arena's propagated time; files prefer full precision.
+            let precise_modified = if node.is_directory() {
+                None
+            } else {
+                filetime_to_unix_ns(meta.modified_filetime)
+            };
+            let seconds_modified = if node.modified_timestamp == 0 {
                 None
             } else {
                 Some(i64::from(node.modified_timestamp) * 1_000_000_000)
             };
+            let modified_ns = precise_modified.or(seconds_modified);
+            let allocated = allocations.get(idx).copied().flatten();
             let created_ns = if node.created_timestamp == 0 {
                 None
             } else {
@@ -217,11 +288,16 @@ fn write_snapshot(
                 if idx == 0 { root_text.as_str() } else { name },
                 i64::from(node.is_directory()),
                 i64::try_from(node.size)?,
-                Option::<i64>::None,
+                allocated.map(i64::try_from).transpose()?,
                 modified_ns,
                 created_ns,
                 i64::from(node.flags),
-                i64::from(node.file_count)
+                i64::from(node.file_count),
+                // Bit-cast: NTFS file references use all 64 bits.
+                (meta.file_id != 0).then_some(meta.file_id as i64),
+                (meta.attributes != u32::MAX).then_some(i64::from(meta.attributes)),
+                reparse_tag_value(&meta),
+                (meta.link_count != 0).then_some(i64::from(meta.link_count))
             ])?;
             if node.is_directory() {
                 dir_insert.execute(params![i64::from(id), &relative])?;
@@ -230,10 +306,17 @@ fn write_snapshot(
             } else {
                 files += 1;
                 bytes = bytes.saturating_add(node.size);
+                match allocated {
+                    Some(value) => allocated_bytes = allocated_bytes.saturating_add(value),
+                    None => unknown_allocations += 1,
+                }
             }
         }
     }
-    tx.execute("INSERT INTO metadata VALUES ('format_version','1')", [])?;
+    tx.execute(
+        "INSERT INTO metadata VALUES ('format_version',?)",
+        [FORMAT_VERSION],
+    )?;
     tx.execute("INSERT INTO metadata VALUES ('root',?)", [&root_text])?;
     tx.execute("INSERT INTO metadata VALUES ('backend',?)", [backend])?;
     tx.execute(
@@ -247,6 +330,15 @@ fn write_snapshot(
     tx.execute(
         "INSERT INTO metadata VALUES ('logical_bytes',?)",
         [bytes.to_string()],
+    )?;
+    // Sum over files whose allocation is known; the count below says how many are not.
+    tx.execute(
+        "INSERT INTO metadata VALUES ('allocated_bytes',?)",
+        [allocated_bytes.to_string()],
+    )?;
+    tx.execute(
+        "INSERT INTO metadata VALUES ('unknown_allocation_files',?)",
+        [unknown_allocations.to_string()],
     )?;
     tx.commit()?;
     emit(
@@ -355,7 +447,7 @@ fn run(args: &Args, sink: &EventSink) -> Result<()> {
         })
     };
     let mut coordinator = Coordinator::new(receiver, shared.clone());
-    coordinator.run_coordinator_loop_headless(&root.to_string_lossy());
+    let metas = coordinator.run_coordinator_loop_headless_with_metadata(&root.to_string_lossy());
     handle
         .join()
         .map_err(|_| anyhow::anyhow!("Traversal thread panicked"))?;
@@ -399,6 +491,9 @@ fn run(args: &Args, sink: &EventSink) -> Result<()> {
     if snapshot.nodes.is_empty() {
         bail!("Scan returned an empty arena");
     }
+    if metas.len() != snapshot.nodes.len() {
+        bail!("Scan metadata does not match the arena");
+    }
     emit(
         sink,
         &json!({"version":1,"type":"progress","phase":"write","nodes":snapshot.nodes.len()}),
@@ -409,6 +504,7 @@ fn run(args: &Args, sink: &EventSink) -> Result<()> {
         root: &root,
         excludes: &excludes,
         backend,
+        metas: &metas,
         sink,
         cancel: shared.scan_cancel.as_ref(),
     };

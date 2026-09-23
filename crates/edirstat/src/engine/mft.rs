@@ -13,10 +13,11 @@ use compact_str::CompactString;
 use crossbeam::channel::{Sender, bounded};
 use smallvec::SmallVec;
 
-use super::traversal::{LocalId, ScanEvent, TraversalStats};
+use super::traversal::{LocalId, NodeMeta, ScanEvent, TraversalStats};
 
 const MFT_RECORD_SIZE: usize = 1024;
 const CHUNK_SIZE: usize = 16 * 1024 * 1024; // 16MB Reusable Staging Buffer
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 
 // Windows kernel storage flags for raw sector-aligned direct I/O
 #[cfg(target_os = "windows")]
@@ -36,9 +37,20 @@ struct AlignedPage {
 struct MftEntry {
     size: u64,
     parent_record_id: u64,
-    modified_timestamp: u32,
+    /// Bytes allocated on disk across all `$DATA` streams, including extension records.
+    allocated_size: u64,
+    /// NTFS file reference: sequence number in the top 16 bits, record number below.
+    file_id: u64,
+    /// Last write time as a raw Windows `FILETIME`; 0 when unknown.
+    modified_filetime: u64,
     created_timestamp: u32,
     name_id: u32,
+    /// Raw `$STANDARD_INFORMATION` attribute bits; `u32::MAX` when unknown.
+    attributes: u32,
+    /// Tag of a resident `$REPARSE_POINT`; 0 when absent or unknown.
+    reparse_tag: u32,
+    /// `$FILE_NAME` attributes outside the DOS namespace, including extension records.
+    link_count: u16,
     name_priority: u8,
     /// Each bit indicates something different when set:
     ///
@@ -50,7 +62,29 @@ struct MftEntry {
     ///   `parent_record_id` instead indicates base record id, update base
     ///   record with the collected metadata then discard this entry.
     flags: u8,
-    _padding: [u8; 2],
+    _padding: [u8; 4],
+}
+
+impl MftEntry {
+    /// Side metadata for the node emitted from this entry.
+    const fn node_meta(&self, is_dir: bool) -> NodeMeta {
+        let attributes = if self.attributes == u32::MAX {
+            u32::MAX
+        } else if is_dir {
+            // `$STANDARD_INFORMATION` omits the directory bit that Windows reports.
+            self.attributes | FILE_ATTRIBUTE_DIRECTORY
+        } else {
+            self.attributes
+        };
+        NodeMeta {
+            allocated_size: if is_dir { u64::MAX } else { self.allocated_size },
+            file_id: self.file_id,
+            modified_filetime: self.modified_filetime,
+            attributes,
+            reparse_tag: self.reparse_tag,
+            link_count: self.link_count as u32,
+        }
+    }
 }
 
 struct TraversalFrame {
@@ -441,48 +475,90 @@ fn parse_attributes(record_data: &[u8]) -> SmallVec<[AttributeHeader<'_>; 6]> {
     attrs
 }
 
-/// Extracts standard info timestamps (created, modified) from an attribute payload.
+/// Little-endian `u64` at `offset`, or `None` past the end of `bytes`.
 #[inline]
-fn parse_standard_information_timestamps(payload: &[u8]) -> Option<(u32, u32)> {
+fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+    bytes
+        .get(offset..offset + 8)
+        .and_then(|raw| raw.try_into().ok())
+        .map(u64::from_le_bytes)
+}
+
+/// Little-endian `u32` at `offset`, or `None` past the end of `bytes`.
+#[inline]
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    bytes
+        .get(offset..offset + 4)
+        .and_then(|raw| raw.try_into().ok())
+        .map(u32::from_le_bytes)
+}
+
+/// Value of a resident attribute, bounded by both its declared length and the record.
+fn resident_value(payload: &[u8]) -> Option<&[u8]> {
     if payload.len() < 24 {
         return None;
     }
+    let val_len = read_u32(payload, 16)? as usize;
     let val_offset = u16::from_le_bytes([payload[20], payload[21]]) as usize;
-    if val_offset + 16 <= payload.len() {
-        let std_info = &payload[val_offset..val_offset + 16];
-        let created = nt_time_to_unix(u64::from_le_bytes([
-            std_info[0],
-            std_info[1],
-            std_info[2],
-            std_info[3],
-            std_info[4],
-            std_info[5],
-            std_info[6],
-            std_info[7],
-        ]));
-        let modified = nt_time_to_unix(u64::from_le_bytes([
-            std_info[8],
-            std_info[9],
-            std_info[10],
-            std_info[11],
-            std_info[12],
-            std_info[13],
-            std_info[14],
-            std_info[15],
-        ]));
-        Some((created, modified))
+    payload.get(val_offset..val_offset.checked_add(val_len)?)
+}
+
+/// Fields of a resident `$STANDARD_INFORMATION` value.
+struct StandardInformation {
+    /// Creation time as Unix seconds.
+    created: u32,
+    /// Last write time as a raw `FILETIME`.
+    modified_filetime: u64,
+    /// Windows file attribute bits, when the value is long enough to hold them.
+    attributes: Option<u32>,
+}
+
+/// Extracts timestamps and attribute bits from a `$STANDARD_INFORMATION` attribute.
+#[inline]
+fn parse_standard_information(payload: &[u8]) -> Option<StandardInformation> {
+    let value = resident_value(payload)?;
+    Some(StandardInformation {
+        created: nt_time_to_unix(read_u64(value, 0)?),
+        modified_filetime: read_u64(value, 8)?,
+        attributes: read_u32(value, 32),
+    })
+}
+
+/// Bytes on disk for one `$DATA` attribute record.
+///
+/// Resident data lives inside the MFT record and allocates nothing. A
+/// non-resident stream split across extension records reports its allocation
+/// only in the extent that starts at VCN 0. Compressed and sparse streams carry
+/// the actually allocated total at offset 64.
+fn data_allocation(attr: &AttributeHeader<'_>) -> u64 {
+    let payload = attr.payload;
+    if !attr.is_non_resident || read_u64(payload, 16) != Some(0) {
+        return 0;
+    }
+    let flags = u16::from_le_bytes([payload[12], payload[13]]);
+    let total_allocated = if flags & (0x0001 | 0x8000) != 0 {
+        read_u64(payload, 64)
     } else {
         None
-    }
+    };
+    total_allocated.or_else(|| read_u64(payload, 40)).unwrap_or(0)
 }
 
 struct MetadataInfo {
     /// All unique directory links from a file record, deduplicating local namespace variants.
     links: SmallVec<[ExtractedLink; 1]>,
-    /// Time when file/folder was last modified.
-    modified: u32,
+    /// Time when file/folder was last modified, as a raw `FILETIME`.
+    modified_filetime: u64,
     /// Time when file/folder was created.
     created: u32,
+    /// Windows attribute bits; `u32::MAX` without `$STANDARD_INFORMATION`.
+    attributes: u32,
+    /// Tag of a resident `$REPARSE_POINT`; 0 when absent.
+    reparse_tag: u32,
+    /// Bytes allocated by the `$DATA` extents in this record.
+    allocated_size: u64,
+    /// `$FILE_NAME` attributes in this record outside the DOS namespace.
+    link_count: u16,
     /// File size.
     size: u64,
     /// `true` if the size is likely correct; otherwise the size is likely incorrect.
@@ -503,8 +579,12 @@ fn extract_metadata_info(
     let mut has_reparse_point = false;
     let mut fallback_size = 0u64;
 
-    let mut modified = 0u32;
+    let mut modified_filetime = 0u64;
     let mut created = 0u32;
+    let mut attributes = u32::MAX;
+    let mut reparse_tag = 0u32;
+    let mut allocated_size = 0u64;
+    let mut link_count = 0u16;
 
     for attr in attrs {
         match attr.ty {
@@ -526,6 +606,10 @@ fn extract_metadata_info(
                     ]) & 0x0000_ffff_ffff_ffff;
 
                     let namespace = val[65];
+                    if namespace != 2 {
+                        // A DOS short name shares its entry with a Win32 name.
+                        link_count = link_count.saturating_add(1);
+                    }
                     let priority = match namespace {
                         1 => 3, // Win32
                         3 => 2, // Win32AndDos
@@ -570,9 +654,12 @@ fn extract_metadata_info(
                     }
                 }
             }
-            0x80 if attr.name_length == 0 => {
-                // $DATA Attribute
-                unnamed_data_size = Some(attr.value_length);
+            0x80 => {
+                // $DATA Attribute; named streams also occupy disk space.
+                if attr.name_length == 0 {
+                    unnamed_data_size = Some(attr.value_length);
+                }
+                allocated_size = allocated_size.saturating_add(data_allocation(attr));
             }
             0x20 => {
                 // $ATTRIBUTE_LIST Attribute
@@ -581,11 +668,19 @@ fn extract_metadata_info(
             0xC0 => {
                 // $REPARSE_POINT Attribute (WOF compression, Cloud Files, symlinks/junctions)
                 has_reparse_point = true;
+                if !attr.is_non_resident
+                    && let Some(tag) = resident_value(attr.payload).and_then(|v| read_u32(v, 0))
+                {
+                    reparse_tag = tag;
+                }
             }
             0x10 if !attr.is_non_resident => {
-                if let Some((cre, mod_t)) = parse_standard_information_timestamps(attr.payload) {
-                    created = cre;
-                    modified = mod_t;
+                if let Some(info) = parse_standard_information(attr.payload) {
+                    created = info.created;
+                    modified_filetime = info.modified_filetime;
+                    if let Some(bits) = info.attributes {
+                        attributes = bits;
+                    }
                 }
             }
             _ => {}
@@ -607,8 +702,12 @@ fn extract_metadata_info(
 
     MetadataInfo {
         links,
-        modified,
+        modified_filetime,
         created,
+        attributes,
+        reparse_tag,
+        allocated_size,
+        link_count,
         size: actual_size,
         size_is_trusted,
         has_attr_list,
@@ -833,15 +932,21 @@ fn process_mft_chunks(
                             local_links.extend(metadata.links);
                         }
 
+                        let sequence = u16::from_le_bytes([record_buffer[16], record_buffer[17]]);
                         *entry_slot = Some(MftEntry {
                             size,
                             parent_record_id,
-                            modified_timestamp: metadata.modified,
+                            allocated_size: metadata.allocated_size,
+                            file_id: (u64::from(sequence) << 48) | record_id as u64,
+                            modified_filetime: metadata.modified_filetime,
                             created_timestamp: metadata.created,
                             name_id,
+                            attributes: metadata.attributes,
+                            reparse_tag: metadata.reparse_tag,
+                            link_count: metadata.link_count,
                             name_priority,
                             flags: entry_flags,
-                            _padding: [0; 2],
+                            _padding: [0; 4],
                         });
                     }
 
@@ -930,6 +1035,12 @@ fn process_mft_chunks(
         let Some(Some(parent)) = mft_entries.get_mut(extension.parent_record_id as usize) else {
             continue;
         };
+        // Streams and names spill into extension records once the base record is full.
+        parent.allocated_size = parent.allocated_size.saturating_add(extension.allocated_size);
+        parent.link_count = parent.link_count.saturating_add(extension.link_count);
+        if parent.reparse_tag == 0 {
+            parent.reparse_tag = extension.reparse_tag;
+        }
         let untrusted_size = (extension.flags & 8) != 0;
         let untrusted_parent_size = (parent.flags & 8) != 0;
         match (untrusted_size, untrusted_parent_size) {
@@ -1068,9 +1179,10 @@ fn process_mft_chunks(
                         local_parent_id: frame.parent_local_id,
                         local_child_id: child_local_id,
                         name: CompactString::new(name_str),
-                        modified_timestamp: entry.modified_timestamp,
+                        modified_timestamp: nt_time_to_unix(entry.modified_filetime),
                         created_timestamp: entry.created_timestamp,
                         no_permission: false,
+                        meta: entry.node_meta(true),
                     });
                     if batch.len() >= BATCH_SIZE {
                         let _ = event_tx.send(std::mem::replace(
@@ -1131,9 +1243,10 @@ fn process_mft_chunks(
                         is_symlink: entry.flags & 2 != 0,
                         is_dataless: false,
                         is_special: false,
-                        modified_timestamp: entry.modified_timestamp,
+                        modified_timestamp: nt_time_to_unix(entry.modified_filetime),
                         created_timestamp: entry.created_timestamp,
                         no_permission: false,
+                        meta: entry.node_meta(false),
                     });
                     if batch.len() >= BATCH_SIZE {
                         let _ = event_tx.send(std::mem::replace(
@@ -1618,6 +1731,121 @@ mod tests {
         assert_eq!(nt_time_to_unix((11_644_473_600 + 1000) * 10_000_000), 1000);
         // Values beyond year 2106 saturate to u32::MAX.
         assert_eq!(nt_time_to_unix(u64::MAX), u32::MAX);
+    }
+
+    /// Resident attribute record of type `ty` holding `value`.
+    fn resident_attr(ty: u32, value: &[u8]) -> Vec<u8> {
+        let mut raw = vec![0u8; 24];
+        raw[0..4].copy_from_slice(&ty.to_le_bytes());
+        raw[4..8].copy_from_slice(&((24 + value.len()) as u32).to_le_bytes());
+        raw[16..20].copy_from_slice(&(value.len() as u32).to_le_bytes());
+        raw[20..22].copy_from_slice(&24u16.to_le_bytes());
+        raw.extend_from_slice(value);
+        raw
+    }
+
+    /// Non-resident `$DATA` extent starting at `vcn`.
+    fn data_attr(name_length: u8, flags: u16, vcn: u64, allocated: u64, total: u64) -> Vec<u8> {
+        let mut raw = vec![0u8; 72];
+        raw[0..4].copy_from_slice(&0x80u32.to_le_bytes());
+        raw[4..8].copy_from_slice(&72u32.to_le_bytes());
+        raw[8] = 1;
+        raw[9] = name_length;
+        raw[12..14].copy_from_slice(&flags.to_le_bytes());
+        raw[16..24].copy_from_slice(&vcn.to_le_bytes());
+        raw[40..48].copy_from_slice(&allocated.to_le_bytes());
+        raw[48..56].copy_from_slice(&1_000_000u64.to_le_bytes());
+        raw[64..72].copy_from_slice(&total.to_le_bytes());
+        raw
+    }
+
+    fn file_name_value(parent: u64, name: &str, namespace: u8) -> Vec<u8> {
+        let units: Vec<u16> = name.encode_utf16().collect();
+        let mut value = vec![0u8; 66];
+        value[0..8].copy_from_slice(&parent.to_le_bytes());
+        value[64] = units.len() as u8;
+        value[65] = namespace;
+        for unit in units {
+            value.extend_from_slice(&unit.to_le_bytes());
+        }
+        value
+    }
+
+    #[test]
+    fn test_metadata_reads_allocation_attributes_and_links() {
+        let modified = 133_000_000_000_000_000u64;
+        let mut standard_information = vec![0u8; 72];
+        standard_information[8..16].copy_from_slice(&modified.to_le_bytes());
+        standard_information[32..36].copy_from_slice(&0x420u32.to_le_bytes());
+
+        let mut record = vec![0u8; 56];
+        record[20..22].copy_from_slice(&56u16.to_le_bytes());
+        for attr in [
+            resident_attr(0x10, &standard_information),
+            resident_attr(0x30, &file_name_value(5, "long name.txt", 1)),
+            // The DOS alias of the same entry is not another link.
+            resident_attr(0x30, &file_name_value(5, "LONGNA~1.TXT", 2)),
+            resident_attr(0x30, &file_name_value(7, "other.txt", 3)),
+            resident_attr(0x80, b"tiny"),
+            // Sparse: the total at offset 64 wins over the nominal allocation.
+            data_attr(0, 0x8000, 0, 1_048_576, 4096),
+            // Named stream (e.g. WofCompressedData) occupies space too.
+            data_attr(17, 0, 0, 8192, 0),
+            // Later extents repeat nothing: allocation lives in the VCN 0 extent.
+            data_attr(0, 0, 5, 65_536, 0),
+            resident_attr(0xC0, &0x9000_001Au32.to_le_bytes()),
+        ] {
+            record.extend_from_slice(&attr);
+        }
+        record.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0]);
+
+        let attrs = parse_attributes(&record);
+        let info = extract_metadata_info(&attrs, 42, 42);
+        assert_eq!(info.modified_filetime, modified);
+        assert_eq!(info.attributes, 0x420);
+        assert_eq!(info.reparse_tag, 0x9000_001A);
+        assert_eq!(info.link_count, 2);
+        assert_eq!(info.allocated_size, 4096 + 8192);
+    }
+
+    #[test]
+    fn test_metadata_without_standard_information_is_unknown() {
+        let mut record = vec![0u8; 56];
+        record[20..22].copy_from_slice(&56u16.to_le_bytes());
+        record.extend_from_slice(&resident_attr(0x30, &file_name_value(5, "a", 1)));
+        record.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0]);
+
+        let info = extract_metadata_info(&parse_attributes(&record), 42, 42);
+        assert_eq!(info.attributes, u32::MAX);
+        assert_eq!(info.modified_filetime, 0);
+        assert_eq!(info.allocated_size, 0);
+        assert_eq!(info.link_count, 1);
+    }
+
+    #[test]
+    fn test_node_meta_marks_directories() {
+        let entry = MftEntry {
+            size: 0,
+            parent_record_id: 5,
+            allocated_size: 4096,
+            file_id: (3u64 << 48) | 42,
+            modified_filetime: 1,
+            created_timestamp: 0,
+            name_id: 0,
+            attributes: 0x20,
+            reparse_tag: 0,
+            link_count: 1,
+            name_priority: 0,
+            flags: 1,
+            _padding: [0; 4],
+        };
+        let dir = entry.node_meta(true);
+        assert_eq!(dir.attributes, 0x30);
+        assert_eq!(dir.allocated_size, u64::MAX);
+        assert_eq!(dir.file_id, (3u64 << 48) | 42);
+        let file = entry.node_meta(false);
+        assert_eq!(file.attributes, 0x20);
+        assert_eq!(file.allocated_size, 4096);
     }
 
     /// An empty (0-byte) exported `$MFT` file yields zero records and must error out.

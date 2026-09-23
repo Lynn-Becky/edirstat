@@ -8,7 +8,7 @@ use crossbeam::channel::Receiver;
 
 pub use edirstat_core::state::SharedState;
 
-use super::traversal::{LocalId, ScanEvent};
+use super::traversal::{LocalId, NodeMeta, ScanEvent};
 use crate::arena::{
     FileArenaSnapshot, FileNode, NO_INDEX, NodeStorage, StringPool, precompute_dir_counts,
 };
@@ -29,19 +29,37 @@ impl Coordinator {
     }
 
     pub fn run_coordinator_loop(&mut self, root_path_str: &str) {
-        self.run_coordinator_loop_with_publishing(root_path_str, true);
+        self.run_coordinator_loop_with_publishing(root_path_str, true, false);
     }
 
     /// Build only the final arena for headless exports. Avoid periodic full-tree clones.
     pub fn run_coordinator_loop_headless(&mut self, root_path_str: &str) {
-        self.run_coordinator_loop_with_publishing(root_path_str, false);
+        self.run_coordinator_loop_with_publishing(root_path_str, false, false);
     }
 
-    fn run_coordinator_loop_with_publishing(&self, root_path_str: &str, publish_live: bool) {
+    /// Build only the final arena plus per-node side metadata indexed like the arena.
+    ///
+    /// Returns an empty vector when the scan was cancelled.
+    #[must_use]
+    pub fn run_coordinator_loop_headless_with_metadata(
+        &mut self,
+        root_path_str: &str,
+    ) -> Vec<NodeMeta> {
+        self.run_coordinator_loop_with_publishing(root_path_str, false, true)
+    }
+
+    fn run_coordinator_loop_with_publishing(
+        &self,
+        root_path_str: &str,
+        publish_live: bool,
+        collect_meta: bool,
+    ) -> Vec<NodeMeta> {
         self.shared_state.is_scanning.store(true, Ordering::SeqCst);
 
         let mut arena = Vec::with_capacity(1024 * 1024); // Pre-allocate space for ~1M nodes
         let mut string_pool = StringPool::new();
+        // Side metadata stays index-aligned with `arena` when collected.
+        let mut metas: Vec<NodeMeta> = Vec::new();
 
         // Local extension tracking in the background thread
         let mut ext_map: std::collections::HashMap<CompactString, (u64, u32), ahash::RandomState> =
@@ -58,6 +76,9 @@ impl Coordinator {
         let root_node = FileNode::new(root_name_id, None, true, false, 0, 0);
         arena.push(root_node);
         last_child_map.push(NO_INDEX);
+        if collect_meta {
+            metas.push(NodeMeta::UNKNOWN);
+        }
 
         // Map root node: LocalId(0) for worker 0 is global index 0
         register_id(&mut id_map, 0, LocalId(0), 0);
@@ -75,9 +96,13 @@ impl Coordinator {
                         ext_map.clear();
                         id_map.clear();
                         last_child_map.clear();
+                        metas.clear();
                         let root_name_id = string_pool.get_or_insert(root_path_str.as_bytes());
                         arena.push(FileNode::new(root_name_id, None, true, false, 0, 0));
                         last_child_map.push(NO_INDEX);
+                        if collect_meta {
+                            metas.push(NodeMeta::UNKNOWN);
+                        }
                         register_id(&mut id_map, 0, LocalId(0), 0);
                         last_publish = Instant::now();
                         dirty = true;
@@ -91,6 +116,7 @@ impl Coordinator {
                         modified_timestamp,
                         created_timestamp,
                         no_permission,
+                        meta,
                     } => {
                         // Resolve parent global index using the parent's creator worker ID
                         if let Some(parent_global_id) =
@@ -113,6 +139,9 @@ impl Coordinator {
                             }
                             arena.push(dir_node);
                             last_child_map.push(NO_INDEX);
+                            if collect_meta {
+                                metas.push(meta);
+                            }
 
                             // Map worker's local child ID to our global index using the child's creator worker ID
                             register_id(
@@ -144,6 +173,7 @@ impl Coordinator {
                         modified_timestamp,
                         created_timestamp,
                         no_permission,
+                        meta,
                     } => {
                         if name.is_empty() && size == 0 {
                             // Directory completion signal
@@ -178,6 +208,9 @@ impl Coordinator {
                             }
                             arena.push(file_node);
                             last_child_map.push(NO_INDEX);
+                            if collect_meta {
+                                metas.push(meta);
+                            }
 
                             // Connect child to sibling chain in O(1)
                             connect_child(
@@ -262,6 +295,7 @@ impl Coordinator {
                 .extension_stats
                 .store(Arc::new(Vec::new()));
             self.shared_state.scan_stats.reset();
+            metas.clear();
         } else {
             // Final size propagation and metrics compilation upon loop exit
             propagate_all_sizes_bottom_up(&mut arena);
@@ -283,6 +317,7 @@ impl Coordinator {
         }
 
         self.shared_state.is_scanning.store(false, Ordering::SeqCst);
+        metas
     }
 }
 
@@ -431,6 +466,7 @@ mod tests {
             modified_timestamp: 0,
             created_timestamp: 0,
             no_permission: false,
+            meta: NodeMeta::UNKNOWN,
         };
         tx.send(vec![
             file("partial"),
@@ -467,6 +503,7 @@ mod tests {
             modified_timestamp: 0,
             created_timestamp: 0,
             no_permission: false,
+            meta: NodeMeta::UNKNOWN,
         }])
         .map_err(std::io::Error::other)?;
         drop(tx);
@@ -498,6 +535,7 @@ mod tests {
             modified_timestamp: 0,
             created_timestamp: 0,
             no_permission: false,
+            meta: NodeMeta::UNKNOWN,
         }])
         .map_err(std::io::Error::other)?;
         drop(tx);
@@ -525,6 +563,7 @@ mod tests {
                 modified_timestamp: 0,
                 created_timestamp: 0,
                 no_permission: false,
+                meta: NodeMeta::UNKNOWN,
             },
             ScanEvent::PermissionDenied {
                 worker_id: 0,
@@ -563,6 +602,7 @@ mod tests {
                 modified_timestamp: 0,
                 created_timestamp: 0,
                 no_permission: false,
+                meta: NodeMeta::UNKNOWN,
             },
             ScanEvent::FileDiscovered {
                 parent_worker_id: 0,
@@ -575,6 +615,7 @@ mod tests {
                 modified_timestamp: 0,
                 created_timestamp: 0,
                 no_permission: false,
+                meta: NodeMeta::UNKNOWN,
             },
             ScanEvent::FileDiscovered {
                 parent_worker_id: 0,
@@ -587,6 +628,7 @@ mod tests {
                 modified_timestamp: 0,
                 created_timestamp: 0,
                 no_permission: false,
+                meta: NodeMeta::UNKNOWN,
             },
         ])
         .map_err(std::io::Error::other)?;
@@ -645,6 +687,7 @@ mod tests {
                 modified_timestamp: 0,
                 created_timestamp: 0,
                 no_permission: false,
+                meta: NodeMeta::UNKNOWN,
             },
             ScanEvent::FileDiscovered {
                 parent_worker_id: 0,
@@ -657,6 +700,7 @@ mod tests {
                 modified_timestamp: 0,
                 created_timestamp: 0,
                 no_permission: false,
+                meta: NodeMeta::UNKNOWN,
             },
         ])
         .map_err(std::io::Error::other)?;
@@ -690,6 +734,7 @@ mod tests {
                 modified_timestamp: 0,
                 created_timestamp: 0,
                 no_permission: false,
+                meta: NodeMeta::UNKNOWN,
             },
             ScanEvent::FileDiscovered {
                 parent_worker_id: 0,
@@ -702,6 +747,7 @@ mod tests {
                 modified_timestamp: 0,
                 created_timestamp: 0,
                 no_permission: false,
+                meta: NodeMeta::UNKNOWN,
             },
         ])
         .map_err(std::io::Error::other)?;
@@ -729,6 +775,72 @@ mod tests {
         assert!(!special_node.is_dataless());
         assert!(special_node.is_special());
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_headless_metadata_stays_aligned_with_arena() -> Result<(), crate::EdirstatError> {
+        let shared = Arc::new(SharedState::new());
+        let (tx, rx) = crossbeam::channel::unbounded();
+        let file_meta = NodeMeta {
+            allocated_size: 4096,
+            file_id: 42,
+            modified_filetime: 133_000_000_000_000_000,
+            attributes: 0x20,
+            reparse_tag: 0,
+            link_count: 2,
+        };
+
+        tx.send(vec![
+            ScanEvent::DirDiscovered {
+                parent_worker_id: 0,
+                child_worker_id: 0,
+                local_parent_id: LocalId(0),
+                local_child_id: LocalId(1),
+                name: CompactString::new("d"),
+                modified_timestamp: 0,
+                created_timestamp: 0,
+                no_permission: false,
+                meta: NodeMeta::UNKNOWN,
+            },
+            // Dropped together with its metadata: the parent was never registered.
+            ScanEvent::FileDiscovered {
+                parent_worker_id: 9,
+                local_parent_id: LocalId(9),
+                name: CompactString::new("orphan"),
+                size: 1,
+                is_symlink: false,
+                is_dataless: false,
+                is_special: false,
+                modified_timestamp: 0,
+                created_timestamp: 0,
+                no_permission: false,
+                meta: NodeMeta::UNKNOWN,
+            },
+            ScanEvent::FileDiscovered {
+                parent_worker_id: 0,
+                local_parent_id: LocalId(1),
+                name: CompactString::new("f"),
+                size: 10,
+                is_symlink: false,
+                is_dataless: false,
+                is_special: false,
+                modified_timestamp: 0,
+                created_timestamp: 0,
+                no_permission: false,
+                meta: file_meta,
+            },
+        ])
+        .map_err(std::io::Error::other)?;
+        drop(tx);
+
+        let metas = Coordinator::new(rx, shared.clone())
+            .run_coordinator_loop_headless_with_metadata("/root");
+        let snapshot = shared.current_snapshot.load();
+        assert_eq!(snapshot.nodes.len(), 3);
+        assert_eq!(metas.len(), snapshot.nodes.len());
+        assert_eq!(metas[0], NodeMeta::UNKNOWN);
+        assert_eq!(metas[2], file_meta);
         Ok(())
     }
 }
