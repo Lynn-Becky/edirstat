@@ -257,7 +257,10 @@ fn write_snapshot(
 }
 
 fn run(args: &Args, sink: &EventSink) -> Result<()> {
-    if args.max_seconds.is_some_and(|seconds| !seconds.is_finite() || seconds <= 0.0) {
+    if args
+        .max_seconds
+        .is_some_and(|seconds| !seconds.is_finite() || seconds <= 0.0)
+    {
         bail!("max-seconds must be positive and finite");
     }
     if args.task_id.is_empty()
@@ -323,7 +326,8 @@ fn run(args: &Args, sink: &EventSink) -> Result<()> {
                 if !scan_finished.load(Ordering::SeqCst)
                     && (max_files.is_some_and(|limit| files >= limit)
                         || max_entries.is_some_and(|limit| files.saturating_add(dirs) >= limit)
-                        || max_seconds.is_some_and(|limit| started.elapsed().as_secs_f64() >= limit))
+                        || max_seconds
+                            .is_some_and(|limit| started.elapsed().as_secs_f64() >= limit))
                 {
                     budget_exceeded.store(true, Ordering::SeqCst);
                     shared.scan_cancel.store(true, Ordering::SeqCst);
@@ -358,9 +362,7 @@ fn run(args: &Args, sink: &EventSink) -> Result<()> {
     {
         bail!("Scan enumeration budget exceeded");
     }
-    if matches!(args.engine, Engine::Mft)
-        && shared.scan_stats.backend.load(Ordering::SeqCst) != 1
-    {
+    if matches!(args.engine, Engine::Mft) && shared.scan_stats.backend.load(Ordering::SeqCst) != 1 {
         bail!("Raw MFT scan unavailable for this root");
     }
     if shared.scan_cancel.load(Ordering::SeqCst) {
