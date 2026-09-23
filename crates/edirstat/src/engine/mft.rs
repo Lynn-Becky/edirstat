@@ -1836,7 +1836,7 @@ mod tests {
             size: 0,
             parent_record_id: 5,
             allocated_size: 4096,
-            file_id: (3u64 << 48) | 42,
+            file_id: (3u64 << 48) | 0x2A,
             modified_filetime: 1,
             created_timestamp: 0,
             name_id: 0,
@@ -1850,7 +1850,7 @@ mod tests {
         let dir = entry.node_meta(true);
         assert_eq!(dir.attributes, 0x30);
         assert_eq!(dir.allocated_size, u64::MAX);
-        assert_eq!(dir.file_id, (3u64 << 48) | 42);
+        assert_eq!(dir.file_id, (3u64 << 48) | 0x2A);
         let file = entry.node_meta(false);
         assert_eq!(file.attributes, 0x20);
         assert_eq!(file.allocated_size, 4096);
