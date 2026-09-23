@@ -77,7 +77,11 @@ impl MftEntry {
             self.attributes
         };
         NodeMeta {
-            allocated_size: if is_dir { u64::MAX } else { self.allocated_size },
+            allocated_size: if is_dir {
+                u64::MAX
+            } else {
+                self.allocated_size
+            },
             file_id: self.file_id,
             modified_filetime: self.modified_filetime,
             attributes,
@@ -541,7 +545,9 @@ fn data_allocation(attr: &AttributeHeader<'_>) -> u64 {
     } else {
         None
     };
-    total_allocated.or_else(|| read_u64(payload, 40)).unwrap_or(0)
+    total_allocated
+        .or_else(|| read_u64(payload, 40))
+        .unwrap_or(0)
 }
 
 struct MetadataInfo {
@@ -1036,7 +1042,9 @@ fn process_mft_chunks(
             continue;
         };
         // Streams and names spill into extension records once the base record is full.
-        parent.allocated_size = parent.allocated_size.saturating_add(extension.allocated_size);
+        parent.allocated_size = parent
+            .allocated_size
+            .saturating_add(extension.allocated_size);
         parent.link_count = parent.link_count.saturating_add(extension.link_count);
         if parent.reparse_tag == 0 {
             parent.reparse_tag = extension.reparse_tag;
