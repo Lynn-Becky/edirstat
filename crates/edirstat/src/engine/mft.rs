@@ -18,6 +18,7 @@ use super::traversal::{LocalId, NodeMeta, ScanEvent, TraversalStats};
 const MFT_RECORD_SIZE: usize = 1024;
 const CHUNK_SIZE: usize = 16 * 1024 * 1024; // 16MB Reusable Staging Buffer
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+const FILE_ATTRIBUTE_EA: u32 = 0x0004_0000;
 
 // Windows kernel storage flags for raw sector-aligned direct I/O
 #[cfg(target_os = "windows")]
@@ -45,9 +46,9 @@ struct MftEntry {
     modified_filetime: u64,
     created_timestamp: u32,
     name_id: u32,
-    /// Raw `$STANDARD_INFORMATION` attribute bits; `u32::MAX` when unknown.
+    /// `$STANDARD_INFORMATION` attribute bits without the on-disk EA flag; `u32::MAX` when unknown.
     attributes: u32,
-    /// Tag of a resident `$REPARSE_POINT`; 0 when absent or unknown.
+    /// Tag of a resident `$REPARSE_POINT` in the base or an extension record; 0 when absent.
     reparse_tag: u32,
     /// `$FILE_NAME` attributes outside the DOS namespace, including extension records.
     link_count: u16,
@@ -524,7 +525,10 @@ fn parse_standard_information(payload: &[u8]) -> Option<StandardInformation> {
     Some(StandardInformation {
         created: nt_time_to_unix(read_u64(value, 0)?),
         modified_filetime: read_u64(value, 8)?,
-        attributes: read_u32(value, 32),
+        // On disk this bit is FILE_ATTRIBUTE_EA ("has extended attributes").
+        // Win32 never reports it for such files; it reuses the value for
+        // RECALL_ON_OPEN, so keeping it would mislabel them as placeholders.
+        attributes: read_u32(value, 32).map(|bits| bits & !FILE_ATTRIBUTE_EA),
     })
 }
 
@@ -820,6 +824,8 @@ fn process_mft_chunks(
 
     let sharded_pool = ShardedStringPool::new(16);
     let side_channel_links = parking_lot::Mutex::new(Vec::new());
+    // (base record, allocated bytes, reparse tag) from extension records without names.
+    let side_channel_extents = parking_lot::Mutex::new(Vec::new());
 
     // Consume chunks and parse records concurrently using Rayon threads
     rayon::scope(|scope| {
@@ -834,6 +840,7 @@ fn process_mft_chunks(
             let start_idx = chunk.start_record_id as usize;
 
             let side_channel_links = &side_channel_links;
+            let side_channel_extents = &side_channel_extents;
             let sharded_pool = &sharded_pool;
             let empty_tx = &empty_tx;
 
@@ -857,6 +864,7 @@ fn process_mft_chunks(
                     let mut chunk = chunk;
                     let chunk_bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut chunk.buffer);
                     let mut local_links = Vec::new();
+                    let mut local_extents = Vec::new();
 
                     for (i, entry_slot) in target_slice.iter_mut().enumerate() {
                         let record_id = start_idx + i;
@@ -901,6 +909,17 @@ fn process_mft_chunks(
                         );
 
                         if metadata.links.is_empty() && !metadata.has_attr_list {
+                            // Streams and reparse data of large or heavily linked files
+                            // spill into extension records that carry no name.
+                            if base_record_id != 0
+                                && (metadata.allocated_size != 0 || metadata.reparse_tag != 0)
+                            {
+                                local_extents.push((
+                                    base_record_id,
+                                    metadata.allocated_size,
+                                    metadata.reparse_tag,
+                                ));
+                            }
                             continue;
                         }
 
@@ -959,6 +978,9 @@ fn process_mft_chunks(
                     if !local_links.is_empty() {
                         side_channel_links.lock().extend(local_links);
                     }
+                    if !local_extents.is_empty() {
+                        side_channel_extents.lock().extend(local_extents);
+                    }
 
                     // Recycle the empty page buffer
                     let _ = empty_tx.send(chunk.buffer);
@@ -978,6 +1000,15 @@ fn process_mft_chunks(
         }
     });
     let mut side_channel_links = side_channel_links.into_inner();
+
+    for (base_record_id, allocated_size, reparse_tag) in side_channel_extents.into_inner() {
+        if let Some(Some(base)) = mft_entries.get_mut(base_record_id as usize) {
+            base.allocated_size = base.allocated_size.saturating_add(allocated_size);
+            if base.reparse_tag == 0 {
+                base.reparse_tag = reparse_tag;
+            }
+        }
+    }
 
     // Deterministic ordering based on the record id where a link was found:
     side_channel_links.sort_by_key(|link| (link.record_id, link.parent_ref, link.source_id));
