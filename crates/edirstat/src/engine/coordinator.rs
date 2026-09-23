@@ -37,7 +37,7 @@ impl Coordinator {
         self.run_coordinator_loop_with_publishing(root_path_str, false);
     }
 
-    fn run_coordinator_loop_with_publishing(&mut self, root_path_str: &str, publish_live: bool) {
+    fn run_coordinator_loop_with_publishing(&self, root_path_str: &str, publish_live: bool) {
         self.shared_state.is_scanning.store(true, Ordering::SeqCst);
 
         let mut arena = Vec::with_capacity(1024 * 1024); // Pre-allocate space for ~1M nodes
@@ -79,7 +79,7 @@ impl Coordinator {
                         arena.push(FileNode::new(root_name_id, None, true, false, 0, 0));
                         last_child_map.push(NO_INDEX);
                         register_id(&mut id_map, 0, LocalId(0), 0);
-                        last_publish = Instant::now() - publish_interval;
+                        last_publish = Instant::now();
                         dirty = true;
                     }
                     ScanEvent::DirDiscovered {

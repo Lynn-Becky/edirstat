@@ -130,43 +130,37 @@ impl TraversalEngine {
                 .is_some_and(|s| s.eq_ignore_ascii_case("$mft"));
 
             if allow_mft && is_mft_file {
-                match super::mft::try_scan_mft(&root_path, &scan_cancel.clone(), &event_tx, &stats)
-                {
-                    Ok(()) => {
-                        stats.backend.store(1, Ordering::SeqCst);
-                        return;
-                    }
-                    Err(_) => {
-                        if mft_only {
-                            return;
-                        }
-                        stats.reset();
-                        stats.mft_fallback.store(true, Ordering::SeqCst);
-                        let _ = event_tx.send(vec![ScanEvent::ResetForFallback]);
-                    }
+                let mft_scan =
+                    super::mft::try_scan_mft(&root_path, &scan_cancel, &event_tx, &stats);
+                if mft_scan.is_ok() {
+                    stats.backend.store(1, Ordering::SeqCst);
+                    return;
                 }
+                if mft_only {
+                    return;
+                }
+                stats.reset();
+                stats.mft_fallback.store(true, Ordering::SeqCst);
+                let _ = event_tx.send(vec![ScanEvent::ResetForFallback]);
             }
 
             // Attempt raw MFT parsing on Windows only if partition is explicitly detected as NTFS
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             {
                 if allow_mft && !is_mft_file && super::mft::is_ntfs(&root_path) {
-                    match super::mft::try_scan_mft(&root_path, &scan_cancel, &event_tx, &stats) {
-                        Ok(()) => {
-                            stats.backend.store(1, Ordering::SeqCst);
-                            // Raw scan was executed successfully, end thread execution
-                            return;
-                        }
-                        Err(_) => {
-                            if mft_only {
-                                return;
-                            }
-                            // Bypassed or failed raw access; fallback continues to parallel walker
-                            stats.reset();
-                            stats.mft_fallback.store(true, Ordering::SeqCst);
-                            let _ = event_tx.send(vec![ScanEvent::ResetForFallback]);
-                        }
+                    let mft_scan =
+                        super::mft::try_scan_mft(&root_path, &scan_cancel, &event_tx, &stats);
+                    if mft_scan.is_ok() {
+                        stats.backend.store(1, Ordering::SeqCst);
+                        return;
                     }
+                    if mft_only {
+                        return;
+                    }
+                    // Bypassed or failed raw access; fallback continues to parallel walker
+                    stats.reset();
+                    stats.mft_fallback.store(true, Ordering::SeqCst);
+                    let _ = event_tx.send(vec![ScanEvent::ResetForFallback]);
                 }
             }
 
