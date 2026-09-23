@@ -10,7 +10,11 @@ edirstat-scan C:\ --output C:\scan-cache\drive.sqlite3 --task-id myscan --same-f
 ```
 
 The adapter writes one immutable SQLite database and UTF-8 JSON Lines progress
-to stdout. `--engine walk` skips raw MFT access for folder scans. `--exclude`
+to stdout. `--engine walk` skips raw MFT access for folder scans;
+`--engine mft` requires a successful raw MFT scan. `--max-files`,
+`--max-entries`, and `--max-seconds` stop enumeration if a budget is reached.
+They fail without publishing a partial inventory so callers can retry with a
+bounded walker. `--exclude`
 may be repeated for application state and quarantine directories. For a
 separately elevated process, `--progress-file` writes the same JSONL protocol
 to a new file, while creation of `--cancel-file` requests cooperative stop.

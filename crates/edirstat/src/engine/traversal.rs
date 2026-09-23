@@ -67,6 +67,7 @@ pub struct TraversalEngine {
     num_threads: usize,
     stats: TraversalStats,
     allow_mft: bool,
+    mft_only: bool,
 }
 
 impl Default for TraversalEngine {
@@ -79,12 +80,23 @@ impl TraversalEngine {
     #[must_use]
     pub fn new(stats: TraversalStats) -> Self {
         let num_threads = thread::available_parallelism().map_or(4, std::num::NonZero::get);
-        Self { num_threads, stats, allow_mft: true }
+        Self {
+            num_threads,
+            stats,
+            allow_mft: true,
+            mft_only: false,
+        }
     }
 
     #[must_use]
     pub const fn without_mft(mut self) -> Self {
         self.allow_mft = false;
+        self
+    }
+
+    #[must_use]
+    pub const fn mft_only(mut self) -> Self {
+        self.mft_only = true;
         self
     }
 
@@ -108,6 +120,7 @@ impl TraversalEngine {
         let num_threads = self.num_threads;
         let stats = self.stats.clone();
         let allow_mft = self.allow_mft;
+        let mft_only = self.mft_only;
 
         let handle = thread::spawn(move || {
             // Run MFT parser directly if target is a file named "$MFT" (case-insensitive)
@@ -124,6 +137,9 @@ impl TraversalEngine {
                         return;
                     }
                     Err(_) => {
+                        if mft_only {
+                            return;
+                        }
                         stats.reset();
                         stats.mft_fallback.store(true, Ordering::SeqCst);
                         let _ = event_tx.send(vec![ScanEvent::ResetForFallback]);
@@ -142,6 +158,9 @@ impl TraversalEngine {
                             return;
                         }
                         Err(_) => {
+                            if mft_only {
+                                return;
+                            }
                             // Bypassed or failed raw access; fallback continues to parallel walker
                             stats.reset();
                             stats.mft_fallback.store(true, Ordering::SeqCst);
@@ -149,6 +168,10 @@ impl TraversalEngine {
                         }
                     }
                 }
+            }
+
+            if mft_only {
+                return;
             }
 
             stats.backend.store(2, Ordering::SeqCst);

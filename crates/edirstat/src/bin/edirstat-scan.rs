@@ -5,25 +5,36 @@ use std::{
     fs::OpenOptions,
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
-use edirstat::{arena::NO_INDEX, coordinator::{Coordinator, SharedState}, traversal::TraversalEngine};
+use edirstat::{
+    arena::NO_INDEX,
+    coordinator::{Coordinator, SharedState},
+    traversal::TraversalEngine,
+};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Engine {
     Auto,
+    Mft,
     Walk,
 }
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Read-only eDirStat scan into a compact SQLite snapshot")]
+#[command(
+    version,
+    about = "Read-only eDirStat scan into a compact SQLite snapshot"
+)]
 struct Args {
     /// Existing directory or drive root.
     path: PathBuf,
@@ -34,6 +45,13 @@ struct Args {
     engine: Engine,
     #[arg(long)]
     same_filesystem: bool,
+    /// Stop without publishing a snapshot if enumeration exceeds this budget.
+    #[arg(long)]
+    max_files: Option<u64>,
+    #[arg(long)]
+    max_entries: Option<u64>,
+    #[arg(long)]
+    max_seconds: Option<f64>,
     #[arg(long)]
     exclude: Vec<PathBuf>,
     /// UTF-8 JSONL events are written to this new file instead of stdout.
@@ -48,8 +66,18 @@ struct Args {
 
 type EventSink = Arc<Mutex<Box<dyn Write + Send>>>;
 
+struct PendingSnapshot(PathBuf);
+
+impl Drop for PendingSnapshot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 fn emit(sink: &EventSink, event: &Value) -> Result<()> {
-    let mut output = sink.lock().map_err(|_| anyhow::anyhow!("progress writer lock poisoned"))?;
+    let mut output = sink
+        .lock()
+        .map_err(|_| anyhow::anyhow!("progress writer lock poisoned"))?;
     serde_json::to_writer(&mut *output, event)?;
     output.write_all(b"\n")?;
     output.flush()?;
@@ -58,8 +86,13 @@ fn emit(sink: &EventSink, event: &Value) -> Result<()> {
 
 fn new_sink(path: Option<&Path>) -> Result<EventSink> {
     let output: Box<dyn Write + Send> = match path {
-        Some(path) => Box::new(OpenOptions::new().write(true).create_new(true).open(path)
-            .with_context(|| format!("Cannot create progress file {}", path.display()))?),
+        Some(path) => Box::new(
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .with_context(|| format!("Cannot create progress file {}", path.display()))?,
+        ),
         None => Box::new(io::stdout()),
     };
     Ok(Arc::new(Mutex::new(output)))
@@ -79,12 +112,18 @@ fn write_snapshot(
         bail!("Output already exists: {}", output.display());
     }
     let file_name = output.file_name().context("Output must have a file name")?;
-    let pending = output.with_file_name(format!("{}.{}.pending", file_name.to_string_lossy(), task_id));
+    let pending = output.with_file_name(format!(
+        "{}.{}.pending",
+        file_name.to_string_lossy(),
+        task_id
+    ));
     if pending.exists() {
         bail!("Pending output already exists: {}", pending.display());
     }
+    let _pending_cleanup = PendingSnapshot(pending.clone());
     let mut db = Connection::open(&pending)?;
-    db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL;
+    db.execute_batch(
+        "PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL;
         CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE nodes (
             id INTEGER PRIMARY KEY, parent_id INTEGER, name TEXT NOT NULL,
@@ -92,7 +131,8 @@ fn write_snapshot(
             modified_ns INTEGER, created_ns INTEGER, flags INTEGER NOT NULL,
             file_count INTEGER NOT NULL
         );
-        CREATE TABLE directories (node_id INTEGER PRIMARY KEY, relative_path TEXT NOT NULL);")?;
+        CREATE TABLE directories (node_id INTEGER PRIMARY KEY, relative_path TEXT NOT NULL);",
+    )?;
     let mut dir_paths: HashMap<u32, String> = HashMap::new();
     let mut excluded_dirs: HashSet<u32> = HashSet::new();
     let mut files = 0u64;
@@ -101,10 +141,13 @@ fn write_snapshot(
     let root_text = root.to_string_lossy().to_string();
     let tx = db.transaction()?;
     {
-        let mut node_insert = tx.prepare_cached("INSERT INTO nodes
+        let mut node_insert = tx.prepare_cached(
+            "INSERT INTO nodes
             (id,parent_id,name,is_dir,size,allocated_size,modified_ns,created_ns,flags,file_count)
-            VALUES (?,?,?,?,?,?,?,?,?,?)")?;
-        let mut dir_insert = tx.prepare_cached("INSERT INTO directories(node_id,relative_path) VALUES (?,?)")?;
+            VALUES (?,?,?,?,?,?,?,?,?,?)",
+        )?;
+        let mut dir_insert =
+            tx.prepare_cached("INSERT INTO directories(node_id,relative_path) VALUES (?,?)")?;
         for (idx, node) in snapshot.nodes.iter().enumerate() {
             if idx % 4096 == 0 && cancel.load(Ordering::Relaxed) {
                 bail!("Scan cancelled during SQLite export");
@@ -117,30 +160,56 @@ fn write_snapshot(
                 }
                 continue;
             }
-            let name = snapshot.string_pool.get(node.name_id).context("Unresolved arena name")?;
+            let name = snapshot
+                .string_pool
+                .get(node.name_id)
+                .context("Unresolved arena name")?;
             let relative = if parent == NO_INDEX {
                 String::new()
             } else {
-                let prefix = dir_paths.get(&parent).context("Arena child without parent directory")?;
-                if prefix.is_empty() { name.to_owned() }
-                else { format!("{prefix}{}{name}", std::path::MAIN_SEPARATOR) }
+                let prefix = dir_paths
+                    .get(&parent)
+                    .context("Arena child without parent directory")?;
+                if prefix.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{prefix}{}{name}", std::path::MAIN_SEPARATOR)
+                }
             };
             if node.is_directory() && idx != 0 {
                 let full_path = root.join(&relative);
-                if excludes.iter().any(|excluded| full_path.starts_with(excluded)) {
+                if excludes
+                    .iter()
+                    .any(|excluded| full_path.starts_with(excluded))
+                {
                     excluded_dirs.insert(id);
                     continue;
                 }
             }
-            let modified_ns = if node.modified_timestamp == 0 { None }
-                else { Some(i64::from(node.modified_timestamp) * 1_000_000_000) };
-            let created_ns = if node.created_timestamp == 0 { None }
-                else { Some(i64::from(node.created_timestamp) * 1_000_000_000) };
+            let modified_ns = if node.modified_timestamp == 0 {
+                None
+            } else {
+                Some(i64::from(node.modified_timestamp) * 1_000_000_000)
+            };
+            let created_ns = if node.created_timestamp == 0 {
+                None
+            } else {
+                Some(i64::from(node.created_timestamp) * 1_000_000_000)
+            };
             node_insert.execute(params![
-                i64::from(id), if parent == NO_INDEX { None } else { Some(i64::from(parent)) },
+                i64::from(id),
+                if parent == NO_INDEX {
+                    None
+                } else {
+                    Some(i64::from(parent))
+                },
                 if idx == 0 { root_text.as_str() } else { name },
-                i64::from(node.is_directory()), i64::try_from(node.size)?,
-                Option::<i64>::None, modified_ns, created_ns, i64::from(node.flags),
+                i64::from(node.is_directory()),
+                i64::try_from(node.size)?,
+                Option::<i64>::None,
+                modified_ns,
+                created_ns,
+                i64::from(node.flags),
                 i64::from(node.file_count)
             ])?;
             if node.is_directory() {
@@ -156,15 +225,29 @@ fn write_snapshot(
     tx.execute("INSERT INTO metadata VALUES ('format_version','1')", [])?;
     tx.execute("INSERT INTO metadata VALUES ('root',?)", [&root_text])?;
     tx.execute("INSERT INTO metadata VALUES ('backend',?)", [backend])?;
-    tx.execute("INSERT INTO metadata VALUES ('file_count',?)", [files.to_string()])?;
-    tx.execute("INSERT INTO metadata VALUES ('directory_count',?)", [dirs.to_string()])?;
-    tx.execute("INSERT INTO metadata VALUES ('logical_bytes',?)", [bytes.to_string()])?;
+    tx.execute(
+        "INSERT INTO metadata VALUES ('file_count',?)",
+        [files.to_string()],
+    )?;
+    tx.execute(
+        "INSERT INTO metadata VALUES ('directory_count',?)",
+        [dirs.to_string()],
+    )?;
+    tx.execute(
+        "INSERT INTO metadata VALUES ('logical_bytes',?)",
+        [bytes.to_string()],
+    )?;
     tx.commit()?;
-    emit(sink, &json!({"version":1,"type":"progress","phase":"index","files":files,"dirs":dirs}))?;
-    db.execute_batch("CREATE INDEX idx_nodes_size ON nodes(is_dir,size DESC,id);
+    emit(
+        sink,
+        &json!({"version":1,"type":"progress","phase":"index","files":files,"dirs":dirs}),
+    )?;
+    db.execute_batch(
+        "CREATE INDEX idx_nodes_size ON nodes(is_dir,size DESC,id);
         CREATE INDEX idx_nodes_parent ON nodes(parent_id,id);
         CREATE INDEX idx_nodes_name ON nodes(name);
-        CREATE INDEX idx_directories_path ON directories(relative_path);")?;
+        CREATE INDEX idx_directories_path ON directories(relative_path);",
+    )?;
     if cancel.load(Ordering::Relaxed) {
         bail!("Scan cancelled during SQLite export");
     }
@@ -174,7 +257,15 @@ fn write_snapshot(
 }
 
 fn run(args: &Args, sink: &EventSink) -> Result<()> {
-    if args.task_id.is_empty() || !args.task_id.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-') {
+    if args.max_seconds.is_some_and(|seconds| !seconds.is_finite() || seconds <= 0.0) {
+        bail!("max-seconds must be positive and finite");
+    }
+    if args.task_id.is_empty()
+        || !args
+            .task_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
         bail!("task-id must contain only ASCII letters, digits, or hyphens");
     }
     let root = std::fs::canonicalize(&args.path)
@@ -182,51 +273,99 @@ fn run(args: &Args, sink: &EventSink) -> Result<()> {
     if !root.is_dir() {
         bail!("Scan root must be a directory");
     }
-    let excludes = args.exclude.iter().filter_map(|path| std::fs::canonicalize(path).ok()).collect::<Vec<_>>();
+    let excludes = args
+        .exclude
+        .iter()
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .collect::<Vec<_>>();
     let started = Instant::now();
-    emit(sink, &json!({"version":1,"type":"start","task_id":args.task_id,
-        "root":args.path.to_string_lossy(),"engine":format!("{:?}", args.engine).to_ascii_lowercase()}))?;
+    emit(
+        sink,
+        &json!({"version":1,"type":"start","task_id":args.task_id,
+        "root":args.path.to_string_lossy(),"engine":format!("{:?}", args.engine).to_ascii_lowercase()}),
+    )?;
 
     let shared = Arc::new(SharedState::new());
     let mut traversal = TraversalEngine::new(shared.scan_stats.clone());
-    if matches!(args.engine, Engine::Walk) {
-        traversal = traversal.without_mft();
-    }
+    traversal = match args.engine {
+        Engine::Auto => traversal,
+        Engine::Mft => traversal.mft_only(),
+        Engine::Walk => traversal.without_mft(),
+    };
     let (sender, receiver) = crossbeam::channel::unbounded();
-    let handle = traversal.start_traversal(root.clone(), args.same_filesystem,
-        shared.scan_cancel.clone(), sender)?;
+    let handle = traversal.start_traversal(
+        root.clone(),
+        args.same_filesystem,
+        shared.scan_cancel.clone(),
+        sender,
+    )?;
     let stop = Arc::new(AtomicBool::new(false));
+    let scan_finished = Arc::new(AtomicBool::new(false));
+    let budget_exceeded = Arc::new(AtomicBool::new(false));
     let ticker = {
         let shared = shared.clone();
         let sink = sink.clone();
         let stop = stop.clone();
+        let scan_finished = scan_finished.clone();
+        let budget_exceeded = budget_exceeded.clone();
         let cancel_path = args.cancel_file.clone();
+        let max_files = args.max_files;
+        let max_entries = args.max_entries;
+        let max_seconds = args.max_seconds;
         thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 if cancel_path.as_ref().is_some_and(|path| path.exists()) {
                     shared.scan_cancel.store(true, Ordering::SeqCst);
                 }
                 let stats = &shared.scan_stats;
-                let _ = emit(&sink, &json!({"version":1,"type":"progress","phase":"scan",
-                    "files":stats.files_scanned.load(Ordering::Relaxed),
-                    "dirs":stats.dirs_scanned.load(Ordering::Relaxed),
-                    "bytes":stats.bytes_scanned.load(Ordering::Relaxed)}));
+                let files = stats.files_scanned.load(Ordering::Relaxed) as u64;
+                let dirs = stats.dirs_scanned.load(Ordering::Relaxed) as u64;
+                if !scan_finished.load(Ordering::SeqCst)
+                    && (max_files.is_some_and(|limit| files >= limit)
+                        || max_entries.is_some_and(|limit| files.saturating_add(dirs) >= limit)
+                        || max_seconds.is_some_and(|limit| started.elapsed().as_secs_f64() >= limit))
+                {
+                    budget_exceeded.store(true, Ordering::SeqCst);
+                    shared.scan_cancel.store(true, Ordering::SeqCst);
+                }
+                let _ = emit(
+                    &sink,
+                    &json!({"version":1,"type":"progress","phase":"scan",
+                    "files":files,
+                    "dirs":dirs,
+                    "bytes":stats.bytes_scanned.load(Ordering::Relaxed)}),
+                );
                 thread::sleep(Duration::from_millis(500));
             }
         })
     };
     let mut coordinator = Coordinator::new(receiver, shared.clone());
     coordinator.run_coordinator_loop_headless(&root.to_string_lossy());
-    stop.store(true, Ordering::SeqCst);
-    let _ = ticker.join();
-    handle.join().map_err(|_| anyhow::anyhow!("Traversal thread panicked"))?;
+    handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("Traversal thread panicked"))?;
+    scan_finished.store(true, Ordering::SeqCst);
+    if budget_exceeded.load(Ordering::SeqCst) {
+        bail!("Scan enumeration budget exceeded");
+    }
+    if matches!(args.engine, Engine::Mft)
+        && shared.scan_stats.backend.load(Ordering::SeqCst) != 1
+    {
+        bail!("Raw MFT scan unavailable for this root");
+    }
     if shared.scan_cancel.load(Ordering::SeqCst) {
-        emit(sink, &json!({"version":1,"type":"cancelled","task_id":args.task_id}))?;
+        emit(
+            sink,
+            &json!({"version":1,"type":"cancelled","task_id":args.task_id}),
+        )?;
         bail!("Scan cancelled");
     }
     if shared.scan_stats.mft_fallback.load(Ordering::SeqCst) {
-        emit(sink, &json!({"version":1,"type":"fallback","from":"mft","to":"walk",
-            "reason":"Raw MFT scan unavailable; directory traversal used"}))?;
+        emit(
+            sink,
+            &json!({"version":1,"type":"fallback","from":"mft","to":"walk",
+            "reason":"Raw MFT scan unavailable; directory traversal used"}),
+        )?;
     }
     let backend = match shared.scan_stats.backend.load(Ordering::SeqCst) {
         1 => "mft",
@@ -237,12 +376,28 @@ fn run(args: &Args, sink: &EventSink) -> Result<()> {
     if snapshot.nodes.is_empty() {
         bail!("Scan returned an empty arena");
     }
-    emit(sink, &json!({"version":1,"type":"progress","phase":"write","nodes":snapshot.nodes.len()}))?;
-    let (files, dirs, bytes) = write_snapshot(&args.output, &args.task_id, &root,
-        &snapshot, &excludes, backend, sink, &shared.scan_cancel)?;
-    emit(sink, &json!({"version":1,"type":"complete","task_id":args.task_id,
+    emit(
+        sink,
+        &json!({"version":1,"type":"progress","phase":"write","nodes":snapshot.nodes.len()}),
+    )?;
+    let (files, dirs, bytes) = write_snapshot(
+        &args.output,
+        &args.task_id,
+        &root,
+        &snapshot,
+        &excludes,
+        backend,
+        sink,
+        &shared.scan_cancel,
+    )?;
+    stop.store(true, Ordering::SeqCst);
+    let _ = ticker.join();
+    emit(
+        sink,
+        &json!({"version":1,"type":"complete","task_id":args.task_id,
         "backend":backend,"files":files,"dirs":dirs,"bytes":bytes,
-        "elapsed_ms":started.elapsed().as_millis()}))?;
+        "elapsed_ms":started.elapsed().as_millis()}),
+    )?;
     Ok(())
 }
 
@@ -250,11 +405,17 @@ fn main() {
     let args = Args::parse();
     let sink = match new_sink(args.progress_file.as_deref()) {
         Ok(sink) => sink,
-        Err(error) => { eprintln!("{error:#}"); std::process::exit(1); }
+        Err(error) => {
+            eprintln!("{error:#}");
+            std::process::exit(1);
+        }
     };
     if let Err(error) = run(&args, &sink) {
-        let _ = emit(&sink, &json!({"version":1,"type":"error","task_id":args.task_id,
-            "message":format!("{error:#}")}));
+        let _ = emit(
+            &sink,
+            &json!({"version":1,"type":"error","task_id":args.task_id,
+            "message":format!("{error:#}")}),
+        );
         eprintln!("{error:#}");
         std::process::exit(1);
     }

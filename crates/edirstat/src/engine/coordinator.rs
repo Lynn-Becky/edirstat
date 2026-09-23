@@ -432,13 +432,20 @@ mod tests {
             created_timestamp: 0,
             no_permission: false,
         };
-        tx.send(vec![file("partial"), ScanEvent::ResetForFallback, file("walker")])
-            .map_err(std::io::Error::other)?;
+        tx.send(vec![
+            file("partial"),
+            ScanEvent::ResetForFallback,
+            file("walker"),
+        ])
+        .map_err(std::io::Error::other)?;
         drop(tx);
         Coordinator::new(rx, shared.clone()).run_coordinator_loop_headless("/root");
         let snapshot = shared.current_snapshot.load();
         assert_eq!(snapshot.nodes.len(), 2);
-        assert_eq!(snapshot.string_pool.get(snapshot.nodes[1].name_id), Some("walker"));
+        assert_eq!(
+            snapshot.string_pool.get(snapshot.nodes[1].name_id),
+            Some("walker")
+        );
         Ok(())
     }
 
