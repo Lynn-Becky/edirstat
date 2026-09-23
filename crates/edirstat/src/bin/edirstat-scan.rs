@@ -123,19 +123,35 @@ fn filetime_to_unix_ns(filetime: u64) -> Option<i64> {
     i64::try_from((i128::from(filetime) - FILETIME_UNIX_EPOCH) * 100).ok()
 }
 
-/// Bytes allocated under each node: a file's own allocation, or the sum over a
-/// directory's files. `None` when any contributing allocation is unknown.
+/// A file's own allocation, or `None` when the scanner could not measure it.
+const fn known_allocation(meta: &NodeMeta) -> Option<u64> {
+    if meta.allocated_size == u64::MAX {
+        None
+    } else {
+        Some(meta.allocated_size)
+    }
+}
+
+/// Whether this path is a further link of a hard-linked file already seen.
+///
+/// Totals count such a file once, at its first path in arena order, so they
+/// stay comparable with the space the volume actually uses.
+fn repeated_link(meta: &NodeMeta, seen: &mut HashSet<u64>) -> bool {
+    meta.link_count > 1 && meta.file_id != 0 && !seen.insert(meta.file_id)
+}
+
+/// Bytes allocated under each directory, summed over its files with hard
+/// links counted once. `None` when any contributing allocation is unknown.
 fn subtree_allocations(nodes: &[FileNode], metas: &[NodeMeta]) -> Vec<Option<u64>> {
+    let mut seen_links = HashSet::new();
     let mut totals: Vec<Option<u64>> = nodes
         .iter()
         .zip(metas)
         .map(|(node, meta)| {
-            if node.is_directory() {
+            if node.is_directory() || repeated_link(meta, &mut seen_links) {
                 Some(0)
-            } else if meta.allocated_size == u64::MAX {
-                None
             } else {
-                Some(meta.allocated_size)
+                known_allocation(meta)
             }
         })
         .collect();
@@ -209,6 +225,7 @@ fn write_snapshot(
     let mut bytes = 0u64;
     let mut allocated_bytes = 0u64;
     let mut unknown_allocations = 0u64;
+    let mut seen_links = HashSet::new();
     let allocations = subtree_allocations(&snapshot.nodes, metas);
     let root_text = root.to_string_lossy().to_string();
     let tx = db.transaction()?;
@@ -272,7 +289,12 @@ fn write_snapshot(
                 Some(i64::from(node.modified_timestamp) * 1_000_000_000)
             };
             let modified_ns = precise_modified.or(seconds_modified);
-            let allocated = allocations.get(idx).copied().flatten();
+            // Every path of a hard-linked file shows the file's own allocation.
+            let allocated = if node.is_directory() {
+                allocations.get(idx).copied().flatten()
+            } else {
+                known_allocation(&meta)
+            };
             let created_ns = if node.created_timestamp == 0 {
                 None
             } else {
@@ -307,6 +329,7 @@ fn write_snapshot(
                 files += 1;
                 bytes = bytes.saturating_add(node.size);
                 match allocated {
+                    Some(_) if repeated_link(&meta, &mut seen_links) => {}
                     Some(value) => allocated_bytes = allocated_bytes.saturating_add(value),
                     None => unknown_allocations += 1,
                 }
@@ -331,7 +354,8 @@ fn write_snapshot(
         "INSERT INTO metadata VALUES ('logical_bytes',?)",
         [bytes.to_string()],
     )?;
-    // Sum over files whose allocation is known; the count below says how many are not.
+    // Sum over files whose allocation is known, each hard-linked file once;
+    // the count below says how many are not known.
     tx.execute(
         "INSERT INTO metadata VALUES ('allocated_bytes',?)",
         [allocated_bytes.to_string()],
