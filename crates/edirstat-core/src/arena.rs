@@ -936,7 +936,7 @@ mod tests {
     #[test]
     fn test_precompute_dir_counts_empty() {
         let counts = precompute_dir_counts(&[]);
-        assert!(counts.is_empty());
+        assert_eq!(counts, [] as [u32; 0]);
     }
 
     #[test]

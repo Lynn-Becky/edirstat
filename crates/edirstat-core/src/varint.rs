@@ -284,7 +284,7 @@ mod tests {
 
     #[test]
     fn test_u8_slice_to_u32_vec() {
-        assert!(u8_slice_to_u32_vec(&[]).is_empty());
+        assert_eq!(u8_slice_to_u32_vec(&[]), [] as [u32; 0]);
 
         // bytemuck cast => native-endian interpretation of each 4-byte group.
         let bytes: [u8; 8] = [0x01, 0x02, 0x03, 0x04, 0xAA, 0xBB, 0xCC, 0xDD];

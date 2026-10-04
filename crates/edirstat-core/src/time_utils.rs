@@ -254,7 +254,7 @@ mod tests {
         let mut labels = std::collections::HashSet::new();
         for variant in CommonTimeFormat::ALL {
             assert!(labels.insert(variant.label()));
-            assert!(!variant.as_str().is_empty());
+            assert_ne!(variant.as_str(), "");
         }
     }
 
