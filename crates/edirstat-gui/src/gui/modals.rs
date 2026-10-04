@@ -2892,7 +2892,7 @@ mod tests {
         assert!(link_path.is_symlink());
 
         // Verify that the softlinked node has been removed from the results
-        assert!(app.deduplicator_results.read().groups.is_empty());
+        assert_eq!(app.deduplicator_results.read().groups.len(), 0);
         assert!(app.deduplicator_results.read().flat_rows.is_empty());
 
         // Clean up
@@ -3011,7 +3011,7 @@ mod tests {
         )))]
         let bytes = include_packed::include_packed!("assets/licenses/linux.md");
 
-        assert!(!bytes.is_empty());
+        assert_ne!(bytes, [] as [u8; 0]);
         let text = String::from_utf8(bytes).map_err(std::io::Error::other)?;
         assert!(
             text.contains("MIT"),
@@ -3125,7 +3125,7 @@ mod tests {
 
     #[test]
     fn edirstat_license_is_embedded_and_matches_root() {
-        assert!(!EDIRSTAT_LICENSE.is_empty());
+        assert_ne!(EDIRSTAT_LICENSE, "");
         assert!(EDIRSTAT_LICENSE.contains("MIT License"));
         assert!(EDIRSTAT_LICENSE.contains("Cody Neiman"));
 

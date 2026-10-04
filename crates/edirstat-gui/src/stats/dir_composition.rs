@@ -340,8 +340,8 @@ mod tests {
         };
         let mut chart = DirCompositionChart::new(0);
         chart.compute(&snapshot);
-        assert!(chart.top_extensions.is_empty());
-        assert!(chart.children_composition.is_empty());
+        assert_eq!(chart.top_extensions.len(), 0);
+        assert_eq!(chart.children_composition.len(), 0);
     }
 
     #[test]
@@ -359,8 +359,8 @@ mod tests {
 
         let mut chart = DirCompositionChart::new(0);
         chart.compute(&snapshot);
-        assert!(chart.top_extensions.is_empty());
-        assert!(chart.children_composition.is_empty());
+        assert_eq!(chart.top_extensions.len(), 0);
+        assert_eq!(chart.children_composition.len(), 0);
     }
 
     #[test]

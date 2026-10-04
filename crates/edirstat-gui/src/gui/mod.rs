@@ -931,12 +931,12 @@ impl GuiApp {
             let pulse = 0.5f64.mul_add((time * 3.0).sin(), 0.5) as f32; // gentle pulsing between 0.0 and 1.0
 
             // Pulsing background and border with theme's scanning color
-            let fill_color = theme::get_color_scanning().linear_multiply(pulse * 0.12 + 0.04);
-            let border_color = theme::get_color_scanning().linear_multiply(pulse * 0.35 + 0.15);
+            let fill_color = theme::get_color_scanning().linear_multiply(pulse.mul_add(0.12, 0.04));
+            let border_color = theme::get_color_scanning().linear_multiply(pulse.mul_add(0.35, 0.15));
             let text_color = if theme::get_current_theme() == theme::AppTheme::Light {
                 egui::Color32::from_rgb(28, 28, 30)
             } else {
-                theme::COLOR_WHITE.linear_multiply(pulse * 0.15 + 0.85)
+                theme::COLOR_WHITE.linear_multiply(pulse.mul_add(0.15, 0.85))
             };
             let hover_active_text = if theme::get_current_theme() == theme::AppTheme::Light {
                 egui::Color32::from_rgb(28, 28, 30)

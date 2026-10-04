@@ -210,7 +210,7 @@ mod tests {
         };
         let mut chart = TemporalTimelineChart::new();
         chart.compute(&snapshot);
-        assert!(chart.sorted_days.is_empty());
+        assert_eq!(chart.sorted_days.len(), 0);
         assert!(chart.daily_totals.is_empty());
     }
 
@@ -275,7 +275,7 @@ mod tests {
         let mut chart = TemporalTimelineChart::new();
         chart.compute(&snapshot);
 
-        assert!(chart.sorted_days.is_empty());
+        assert_eq!(chart.sorted_days.len(), 0);
         assert!(chart.daily_totals.is_empty());
     }
 

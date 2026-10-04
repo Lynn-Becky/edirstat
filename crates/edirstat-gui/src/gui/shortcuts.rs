@@ -123,12 +123,12 @@ mod tests {
     fn test_format_shortcut_context() {
         let ctx = test_context();
         let formatted = format_shortcut(&ctx, &SHORTCUT_NEW_SCAN);
-        assert!(!formatted.is_empty());
+        assert_ne!(formatted, "");
         assert!(formatted.contains('O') || formatted.contains('o'));
 
         ctx.set_os(egui::os::OperatingSystem::Mac);
         let formatted_mac = format_shortcut(&ctx, &SHORTCUT_NEW_SCAN);
-        assert!(!formatted_mac.is_empty());
+        assert_ne!(formatted_mac, "");
     }
 
     #[test]

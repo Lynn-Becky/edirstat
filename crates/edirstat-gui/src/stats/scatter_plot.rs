@@ -229,7 +229,7 @@ mod tests {
         };
         let mut chart = FileAgeSizeScatterChart::new();
         chart.compute(&snapshot);
-        assert!(chart.top_files.is_empty());
+        assert_eq!(chart.top_files.len(), 0);
         assert_eq!(chart.max_timestamp, 0);
     }
 

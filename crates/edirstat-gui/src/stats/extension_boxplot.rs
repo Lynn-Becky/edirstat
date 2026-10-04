@@ -220,8 +220,8 @@ mod tests {
         };
         let mut chart = ExtensionBoxplotChart::new();
         chart.compute(&snapshot);
-        assert!(chart.top_extensions.is_empty());
-        assert!(chart.computed_spreads.is_empty());
+        assert_eq!(chart.top_extensions.len(), 0);
+        assert_eq!(chart.computed_spreads.len(), 0);
     }
 
     #[test]
@@ -252,7 +252,7 @@ mod tests {
         let mut chart = ExtensionBoxplotChart::new();
         chart.compute(&snapshot);
 
-        assert!(chart.computed_spreads.is_empty());
+        assert_eq!(chart.computed_spreads.len(), 0);
     }
 
     #[test]
@@ -401,7 +401,7 @@ mod tests {
         let mut chart = ExtensionBoxplotChart::new();
         chart.compute(&snapshot);
 
-        assert!(chart.computed_spreads.is_empty());
-        assert!(chart.top_extensions.is_empty());
+        assert_eq!(chart.computed_spreads.len(), 0);
+        assert_eq!(chart.top_extensions.len(), 0);
     }
 }
