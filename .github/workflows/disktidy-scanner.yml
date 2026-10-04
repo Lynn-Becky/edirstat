@@ -44,6 +44,8 @@ jobs:
           & target/x86_64-pc-windows-msvc/release/edirstat-scan.exe $smokeRoot --output $snapshot --engine walk
           if ($LASTEXITCODE -ne 0) { throw 'Scanner failed' }
           if (!(Test-Path -LiteralPath $snapshot)) { throw 'SQLite snapshot missing' }
+          python -c "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); row=db.execute('SELECT file_id FROM nodes WHERE name=? AND is_dir=0', ('file.txt',)).fetchone(); assert row and row[0], 'Walk file identity missing'" $snapshot
+          if ($LASTEXITCODE -ne 0) { throw 'Walk identity check failed' }
       - name: Upload scanner and resolved lockfile
         uses: actions/upload-artifact@v4
         with:

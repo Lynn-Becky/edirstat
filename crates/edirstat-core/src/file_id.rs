@@ -42,17 +42,12 @@ pub const fn get_file_id(_path: &Path, _meta: &fs::Metadata) -> (u64, u64) {
 
 /// File identifier for a directory entry encountered during traversal.
 ///
-/// On Windows every path lookup costs an extra file open, so only
-/// directories get a real ID there — they are the entries cycle and
-/// device-boundary checks apply to. Files keep the `(0, 0)` fallback.
+/// On Windows every entry needs its original identity for consumers that
+/// revalidate a scan before acting on a file. Failed queries remain unknown.
 #[cfg(windows)]
 #[must_use]
 pub fn get_entry_file_id(entry: &fs::DirEntry, meta: &fs::Metadata) -> (u64, u64) {
-    if meta.is_dir() {
-        get_file_id(&entry.path(), meta)
-    } else {
-        (0, 0)
-    }
+    get_file_id(&entry.path(), meta)
 }
 
 /// File identifier for a directory entry encountered during traversal.
