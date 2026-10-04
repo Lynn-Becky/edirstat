@@ -26,6 +26,11 @@ jobs:
       - name: Cache dependencies
         uses: swatinem/rust-cache@v2
 
+      - name: Use supported stable toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup override set stable
+
       - name: Check typos
         run: ./scripts/check.sh typos
 
