@@ -932,7 +932,8 @@ impl GuiApp {
 
             // Pulsing background and border with theme's scanning color
             let fill_color = theme::get_color_scanning().linear_multiply(pulse.mul_add(0.12, 0.04));
-            let border_color = theme::get_color_scanning().linear_multiply(pulse.mul_add(0.35, 0.15));
+            let border_color =
+                theme::get_color_scanning().linear_multiply(pulse.mul_add(0.35, 0.15));
             let text_color = if theme::get_current_theme() == theme::AppTheme::Light {
                 egui::Color32::from_rgb(28, 28, 30)
             } else {
